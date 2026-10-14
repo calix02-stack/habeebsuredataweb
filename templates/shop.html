@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% from "_share.html" import share_row %}
+{% block title %}Study shop — exam novels, packs & the offline simulator{% endblock %}
+{% block og_title %}The PrepNova Study Shop — novels, question packs & the offline simulators, from ₦500{% endblock %}
+{% block og_description %}The recommended novels for JAMB and WAEC, decoded: The Lekki Headmaster (JAMB 2026) and So the Path Does Not Die (WAEC 2026–2030). Chapter summaries, character guides, themes and 50 explained questions. Instant download.{% endblock %}
+{% block og_image %}{{ request.url_root.rstrip('/') }}{{ url_for('static', filename='img/share-novels.png') }}{% endblock %}
+{% block description %}The recommended novels for JAMB and WAEC, decoded into complete study packs: The Lekki Headmaster (JAMB 2026 compulsory novel) and So the Path Does Not Die (WAEC 2026–2030 African prose), plus past-style question packs. Instant download, no account needed.{% endblock %}
+
+{% block content %}
+<div class="pn-page-head anim-rise">
+    <div>
+        <div class="pn-breadcrumb"><a href="{{ url_for('home') }}">Home</a><i class="bi bi-chevron-right"></i><span>Study shop</span></div>
+        <h1>🛍 The PrepNova Study Shop</h1>
+        <p class="lead">The recommended novels every candidate must read, decoded into complete study packs — chapter summaries, character guides, themes and 50 explained questions. Plus the Offline simulators — the full JAMB mock and every WAEC objective paper, each in one file, no network needed. Pay once, download instantly. No account needed.</p>
+        <div class="mt-3">{{ share_row(request.url_root.rstrip('/') ~ url_for('shop'), 'The PrepNova Study Shop — exam novels, question packs & the offline JAMB simulator, from ₦500:') }}</div>
+    </div>
+</div>
+
+<div class="row g-4">
+    {% for p in products %}
+    <div class="col-md-6 col-lg-4">
+        {% set offline = p['slug'].startswith('offline-') %}
+        {% set novel = 'past-questions' not in p['slug'] and not offline %}
+        <div class="card border-0 shadow-sm h-100 anim-rise d{{ loop.index0 }}">
+            <div class="card-body d-flex flex-column">
+                <div class="pn-stat-icon {{ 'tint-green' if offline else ('tint-gold' if novel else 'tint-blue') }} mb-3"><i class="bi {{ 'bi-phone' if offline else ('bi-book-half' if novel else 'bi-file-earmark-text') }}"></i></div>
+                {% if badges.get(p['slug']) %}<span class="badge rounded-pill bg-{{ badges[p['slug']][1] }} bg-opacity-10 text-{{ badges[p['slug']][1] }}-emphasis align-self-start mb-2">{{ badges[p['slug']][0] }}</span>{% endif %}
+                <h2 class="h5">{{ p['title'] }}</h2>
+                <p class="small text-muted flex-grow-1">{{ p['blurb'] }}</p>
+                <div class="d-flex align-items-center justify-content-between mt-2">
+                    <div><span class="fs-4 fw-bold text-primary">{{ p['price']|naira }}</span>{% if p['sold'] %}<span class="small text-muted ms-1">· {{ p['sold'] }} sold</span>{% endif %}</div>
+                    <a href="{{ url_for('product_page', slug=p['slug']) }}" class="btn {{ 'btn-accent' if novel else 'btn-primary' }}">View pack</a>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+<div class="row g-3 mt-4 anim-rise d2">
+    <div class="col-md-4"><div class="pn-feature h-100"><span class="pn-feature-icon tint-green"><i class="bi bi-lightning-charge"></i></span>
+        <h4>Instant download</h4><p>Pay by card, transfer or USSD — the download starts the moment payment is confirmed.</p></div></div>
+    <div class="col-md-4"><div class="pn-feature h-100"><span class="pn-feature-icon tint-blue"><i class="bi bi-phone"></i></span>
+        <h4>Read anywhere</h4><p>Print it or read on your phone — no internet needed after downloading.</p></div></div>
+    <div class="col-md-4"><div class="pn-feature h-100"><span class="pn-feature-icon tint-gold"><i class="bi bi-gift"></i></span>
+        <h4>Great as a gift</h4><p>The download link works for anyone you send it to — perfect for parents buying for their children.</p></div></div>
+</div>
+{% endblock %}

@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}Confirm {{ plan['plan_name'] }} plan{% endblock %}
+
+{% block content %}
+<div class="pn-page-head anim-rise">
+    <div>
+        <div class="pn-breadcrumb"><a href="{{ url_for('subscribe') }}">Subscription</a><i class="bi bi-chevron-right"></i><span>Checkout</span></div>
+        <h1>Confirm your order</h1>
+        <p class="lead">You will be redirected to Paystack's secure checkout to complete payment.</p>
+    </div>
+</div>
+
+<div class="row justify-content-center g-4">
+    <div class="col-lg-5">
+        <div class="card anim-rise">
+            <div class="card-header"><i class="bi bi-receipt me-2 text-primary"></i>Order summary</div>
+            <div class="card-body">
+                <div class="d-flex justify-content-between py-2 border-bottom"><span class="text-muted">Plan</span><b>{{ plan['plan_name'] }}</b></div>
+                <div class="d-flex justify-content-between py-2 border-bottom"><span class="text-muted">Duration</span><b>{{ plan['duration_days'] }} days</b></div>
+                <div class="d-flex justify-content-between py-2 border-bottom"><span class="text-muted">Account</span><b class="text-truncate ms-3">{{ user['email'] }}</b></div>
+                {% if sub.active and not sub.is_trial %}
+                <div class="d-flex justify-content-between py-2 border-bottom"><span class="text-muted">Current plan ends</span><b>{{ sub.end_date|nicedate }}</b></div>
+                <div class="small text-muted py-2">Your new plan will start when the current one ends — no days lost.</div>
+                {% endif %}
+                <div class="d-flex justify-content-between py-2 border-bottom"><span class="text-muted">Promo code</span>
+                    <span>
+                        <input name="promo_code" id="promoCode" class="form-control form-control-sm d-inline-block text-uppercase" style="width:130px" placeholder="CODE" maxlength="24" autocomplete="off">
+                        <button type="button" class="btn btn-sm btn-outline-primary" id="promoBtn">Apply</button>
+                        <div class="small mt-1" id="promoMsg"></div>
+                    </span>
+                </div>
+                <div class="d-flex justify-content-between align-items-center pt-3"><span class="fw-bold">Total</span><span class="h3 mb-0 fw-bold text-primary" id="totalPrice">{{ plan['price']|naira }}</span></div>
+            </div>
+            <div class="card-footer bg-transparent">
+                {% if paystack_ready %}
+                <form method="POST" action="{{ url_for('initialize_payment', plan_id=plan['id']) }}" data-once id="payForm">
+                    <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token() }}">
+                    <input type="hidden" name="promo_code" id="promoField" value="">
+                    <div class="form-check text-start mb-3">
+                        <input class="form-check-input" type="checkbox" name="auto_renew" id="autoRenew">
+                        <label class="form-check-label small" for="autoRenew">
+                            <i class="bi bi-arrow-repeat text-primary"></i> <b>Renew automatically</b> when this plan ends — no gaps, cancel anytime from my dashboard.
+                            <span class="d-block text-muted">Uses this card. We email you before every charge.</span>
+                        </label>
+                    </div>
+                    <button class="btn btn-accent btn-lg w-100 fw-bold" data-loading="Connecting to Paystack…"><i class="bi bi-lock-fill me-1"></i> <span id="payBtnLabel">Pay {{ plan['price']|naira }} securely</span></button>
+                </form>
+                <script>
+                (function () {
+                    var btn = document.getElementById('promoBtn'), code = document.getElementById('promoCode'),
+                        msg = document.getElementById('promoMsg'), total = document.getElementById('totalPrice'),
+                        pay = document.getElementById('payBtnLabel'), base = {{ plan['price'] }}, okCode = '';
+                    btn.addEventListener('click', function () {
+                        var c = code.value.trim();
+                        if (!c) { okCode = ''; document.getElementById('promoField').value = ''; msg.textContent = ''; total.textContent = fmtNaira(base); pay.textContent = 'Pay ' + fmtNaira(base) + ' securely'; return; }
+                        fetch('/promo/check?code=' + encodeURIComponent(c) + '&amount=' + base + '&scope=plans')
+                            .then(function (r) { return r.json(); })
+                            .then(function (d) {
+                                if (d.ok) {
+                                    okCode = c;
+                                    msg.innerHTML = '<span class="text-success"><i class="bi bi-check-circle-fill"></i> ' + d.message + '</span>';
+                                    total.textContent = fmtNaira(d.total); pay.textContent = 'Pay ' + fmtNaira(d.total) + ' securely';
+                                } else {
+                                    okCode = '';
+                                    msg.innerHTML = '<span class="text-danger"><i class="bi bi-x-circle-fill"></i> ' + (d.message || 'Code not valid') + '</span>';
+                                    total.textContent = fmtNaira(base); pay.textContent = 'Pay ' + fmtNaira(base) + ' securely';
+                                }
+                                document.getElementById('promoField').value = okCode;
+                            });
+                    });
+                    document.getElementById('payForm').addEventListener('submit', function () {
+                        document.getElementById('promoField').value = okCode;
+                    });
+                    function fmtNaira(n) { return '₦' + Number(n).toLocaleString('en-NG', { maximumFractionDigits: 0 }); }
+                })();
+                </script>
+                {% else %}
+                <button class="btn btn-secondary btn-lg w-100" disabled>Online payment not configured</button>
+                <div class="small text-muted mt-2 text-center">Contact support on <a href="https://wa.me/{{ support_whatsapp }}" target="_blank" rel="noopener">WhatsApp</a> to activate manually.</div>
+                {% endif %}
+                <a href="{{ url_for('subscribe') }}" class="btn btn-link w-100 mt-1 text-muted">Change plan</a>
+            </div>
+        </div>
+    </div>
+    <div class="col-lg-4">
+        <div class="card anim-rise d1 h-100">
+            <div class="card-body">
+                <h3 class="h6 text-uppercase text-muted ls-1 mb-3">What happens next</h3>
+                <div class="pn-step mb-3"><span class="num">1</span><div><b>Paystack checkout</b><p class="mb-0 small text-muted">Pay with card, bank transfer, USSD or Opay/Palmpay.</p></div></div>
+                <div class="pn-step mb-3"><span class="num">2</span><div><b>Automatic verification</b><p class="mb-0 small text-muted">We confirm the payment directly with Paystack — no screenshots needed.</p></div></div>
+                <div class="pn-step"><span class="num">3</span><div><b>Instant access</b><p class="mb-0 small text-muted">Your subscription activates immediately and you are returned to your dashboard.</p></div></div>
+                <hr>
+                <div class="small text-muted"><i class="bi bi-shield-check text-success me-1"></i>Payments are encrypted and processed by Paystack (PCI-DSS compliant). PrepNova never stores card details.</div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

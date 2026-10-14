@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Corrections — {{ r['exam_type'] }} {{ r['exam_name'] }}{% endblock %}
+
+{% block content %}
+<div class="pn-page-head anim-rise">
+    <div>
+        {% if admin_view %}
+        <div class="pn-breadcrumb"><a href="{{ url_for('admin_bp.manage_results') }}">Results</a><i class="bi bi-chevron-right"></i><a href="{{ url_for('admin_bp.view_result', result_id=r['id']) }}">Result #{{ r['id'] }}</a><i class="bi bi-chevron-right"></i><span>Corrections</span></div>
+        <h1>Corrections &amp; explanations <span class="badge text-bg-secondary align-middle" style="font-size:.7rem">Admin view</span></h1>
+        <p class="lead">{{ r['username'] }} · {{ r['exam_type'] }} · {{ r['exam_name'] }} · scored {{ r['score'] }}/{{ r['total'] }}</p>
+        {% else %}
+        <div class="pn-breadcrumb"><a href="{{ url_for('my_results') }}">My results</a><i class="bi bi-chevron-right"></i><a href="{{ url_for('result_details', result_id=r['id']) }}">Result #{{ r['id'] }}</a><i class="bi bi-chevron-right"></i><span>Corrections</span></div>
+        <h1>Corrections &amp; explanations</h1>
+        <p class="lead">{{ r['exam_type'] }} · {{ r['exam_name'] }} · scored {{ r['score'] }}/{{ r['total'] }}</p>
+        {% endif %}
+    </div>
+    <div class="btn-group" role="group">
+        {% set review_ep = 'admin_bp.admin_review_answers' if admin_view else 'review_answers' %}
+        <a href="{{ url_for(review_ep, result_id=r['id'], show='all') }}" class="btn btn-outline-primary {{ 'active' if show != 'wrong' }}">All</a>
+        <a href="{{ url_for(review_ep, result_id=r['id'], show='wrong') }}" class="btn btn-outline-primary {{ 'active' if show == 'wrong' }}">Wrong only</a>
+    </div>
+</div>
+
+{% if subjects|length > 1 %}
+<div class="d-flex flex-wrap gap-2 mb-3 anim-rise d1" id="subjectFilter">
+    <button class="btn btn-sm btn-primary" data-subject="">All subjects</button>
+    {% for s in subjects %}<button class="btn btn-sm btn-outline-primary" data-subject="{{ s }}">{{ s }}</button>{% endfor %}
+</div>
+{% endif %}
+
+{% if items %}
+<div id="reviewList">
+    {% for it in items %}
+    <div class="pn-review-item {{ 'ok' if it.is_correct else 'bad' }} reveal" data-subject="{{ it.subject }}">
+        <div class="d-flex justify-content-between align-items-start gap-2 mb-2">
+            <div class="pn-qnum">Q{{ it.n }} <span class="text-muted fw-semibold">· {{ it.subject }}</span></div>
+            {% if it.is_correct %}<span class="badge bg-success"><i class="bi bi-check-lg"></i> Correct</span>{% elif it.selected %}<span class="badge bg-danger"><i class="bi bi-x-lg"></i> Wrong</span>{% else %}<span class="badge bg-secondary">Not answered</span>{% endif %}
+        </div>
+        {% if it.passage %}{{ it.passage|passage_html }}{% endif %}
+        <div class="pn-qtext{% if it.orals %} pn-qtext-orals{% endif %}">{% if it.orals %}<button class="pn-say pn-say-stem" type="button" data-say="{{ it.text|say }}"><i class="bi bi-volume-up-fill"></i> Hear this question</button>{% endif %}{{ it.text }}</div>
+        {% if it.options %}
+            {% for k, v in it.options.items() %}
+            <div class="pn-option locked {% if k == it.correct %}correct{% elif k == it.selected %}wrong{% endif %}">
+                <span class="key">{{ k }}</span><span class="txt">{{ v }}</span>{% if it.orals %}<button class="pn-say pn-say-opt" type="button" data-say="{{ v }}" aria-label="Listen to option {{ k }}"><i class="bi bi-volume-up-fill"></i></button>{% endif %}
+                {% if k == it.correct %}<i class="bi bi-check-circle-fill text-success ms-auto"></i>{% elif k == it.selected %}<i class="bi bi-x-circle-fill text-danger ms-auto"></i>{% endif %}
+            </div>
+            {% endfor %}
+        {% else %}
+            <div class="d-flex flex-wrap gap-3 small mb-2"><span>Your answer: <b class="{{ 'text-success' if it.is_correct else 'text-danger' }}">{{ it.selected or '—' }}</b></span><span>Correct answer: <b class="text-success">{{ it.correct }}</b></span></div>
+        {% endif %}
+        {% if it.explanation %}
+        <div class="pn-explain {{ '' if it.is_correct else 'wrong' }} mt-2"><h5><i class="bi bi-lightbulb me-1"></i>Explanation</h5><div style="white-space:pre-line">{{ it.explanation }}</div></div>
+        {% endif %}
+        {% if it.question_id and it.source %}
+        <div class="text-end mt-2"><button type="button" class="btn btn-link btn-sm p-0 text-decoration-none pn-report-link" data-report='{{ {"question_id": it.question_id, "source": it.source, "subject": it.subject, "exam_type": r["exam_type"], "result_id": r["id"]}|tojson }}'><i class="bi bi-flag"></i> <span>Report question</span></button></div>
+        {% endif %}
+    </div>
+    {% endfor %}
+</div>
+{% include "_report_modal.html" %}
+{% else %}
+<div class="pn-empty card"><span class="ico"><i class="bi bi-emoji-sunglasses"></i></span><h3>{% if show == 'wrong' %}No wrong answers — perfect score!{% else %}No review data{% endif %}</h3><p>{% if show == 'wrong' %}Outstanding. Try a harder subject next.{% else %}This result has no stored corrections.{% endif %}</p><a href="{{ url_for('exam_types') }}" class="btn btn-primary btn-sm">Take another mock</a></div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    var f = document.getElementById('subjectFilter'); if (!f) return;
+    f.addEventListener('click', function(e){
+        var b = e.target.closest('button'); if (!b) return;
+        f.querySelectorAll('button').forEach(function(x){ x.classList.remove('btn-primary'); x.classList.add('btn-outline-primary'); });
+        b.classList.add('btn-primary'); b.classList.remove('btn-outline-primary');
+        var s = b.dataset.subject;
+        document.querySelectorAll('.pn-review-item').forEach(function(it){ it.classList.toggle('d-none', !!s && it.dataset.subject !== s); });
+    });
+})();
+</script>
+{% endblock %}

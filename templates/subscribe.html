@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}Subscription plans{% endblock %}
+
+{% block content %}
+<div class="pn-page-head anim-rise">
+    <div>
+        <div class="pn-breadcrumb"><a href="{{ url_for('dashboard') }}">Dashboard</a><i class="bi bi-chevron-right"></i><span>Subscription</span></div>
+        <h1>Choose your plan</h1>
+        <p class="lead">Unlimited full mock exams, unlimited practice, detailed corrections and PDF result slips.</p>
+    </div>
+</div>
+
+{% if sub.active %}
+<div class="alert {{ 'alert-warning' if sub.is_trial else 'alert-success' }} d-flex align-items-center gap-3 anim-rise">
+    <span class="pn-stat-icon {{ 'tint-gold' if sub.is_trial else 'tint-green' }}"><i class="bi {{ 'bi-hourglass-split' if sub.is_trial else 'bi-patch-check-fill' }}"></i></span>
+    <div class="flex-grow-1">
+        <b>{{ 'Free trial active' if sub.is_trial else sub.plan ~ ' plan active' }}</b> — {{ sub.days_left }} day{{ '' if sub.days_left == 1 else 's' }} left (expires {{ sub.end_date|nicedate }}).
+        {% if sub.is_trial %}Subscribe now so your access continues without interruption.{% else %}Paying again extends your current plan from its expiry date.{% endif %}
+    </div>
+</div>
+{% elif sub.status == 'Expired' %}
+<div class="alert alert-danger d-flex align-items-center gap-3 anim-rise"><span class="pn-stat-icon tint-red"><i class="bi bi-exclamation-octagon"></i></span><div><b>Your {{ sub.plan }} plan has expired.</b> Renew below to continue taking mock exams.</div></div>
+{% endif %}
+
+<div class="card anim-rise mb-4 pn-pin-card {{ 'pn-pin-focus' if pin_open }}" id="pin">
+    <div class="card-body">
+        <div class="d-flex flex-wrap align-items-center justify-content-between gap-3">
+            <div class="d-flex align-items-center gap-3">
+                <span class="pn-stat-icon tint-gold"><i class="bi bi-ticket-perforated-fill"></i></span>
+                <div><b>Have an Access PIN?</b><div class="small text-muted">From your school, a tutorial centre, a scholarship, a gift from family or the PrepNova team. Enter it to unlock full access instantly — no card needed.</div></div>
+<p class="small text-muted mt-2 mb-0"><i class="bi bi-mortarboard me-1"></i>Running a lesson centre or school? <a href="{{ url_for('centre.schools') }}">See bulk pricing for your whole class →</a></p>
+            <p class="small text-muted mt-2 mb-0"><i class="bi bi-briefcase me-1"></i>Want to earn while you study? <a href="{{ url_for('agent_page') }}"><b>Become an agent</b></a> — buy PINs at 40% off and sell to friends at full price.</p>
+            <p class="small text-muted mt-2 mb-0"><i class="bi bi-book-half me-1"></i>Prefer printable? <a href="{{ url_for('shop') }}">Browse the Study shop</a> — exam novels, question packs &amp; the offline simulator, from ₦500.</p>
+            </div>
+            <form method="POST" action="{{ url_for('redeem_pin') }}" class="d-flex gap-2 flex-grow-1 flex-sm-grow-0" data-once>
+                <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token() }}">
+                <input class="form-control pn-pin-input" name="pin" placeholder="PN-XXXX-XXXX" maxlength="30" autocomplete="off" autocapitalize="characters" spellcheck="false" required {% if pin_open %}autofocus{% endif %}>
+                <button class="btn btn-accent fw-bold text-nowrap" data-loading="Checking…">Use PIN</button>
+            </form>
+        </div>
+    </div>
+</div>
+
+{% if not paystack_ready %}
+<div class="alert alert-warning small anim-rise"><i class="bi bi-exclamation-triangle me-1"></i>Online payment is being set up. Please contact support on WhatsApp to activate a plan manually.</div>
+{% endif %}
+
+<div class="alert alert-info d-flex align-items-center gap-3 anim-rise">
+    <span class="pn-stat-icon tint-gold"><i class="bi bi-gift"></i></span>
+    <div class="flex-grow-1">Buying for a friend, sibling or your child? <a href="{{ url_for('gift_page') }}" class="fw-semibold">Gift a subscription</a> — pay once and they receive a PIN. You don't need an account.</div>
+</div>
+
+<div class="row g-4 justify-content-center">
+    {% for p in plans %}
+    {% set monthly = (p['price'] / (p['duration_days'] / 30))|round|int %}
+    {% set featured = loop.index == 2 %}
+    <div class="col-md-6 col-lg-4">
+        <div class="pn-price h-100 anim-rise d{{ loop.index0 }} {{ 'featured' if featured }}">
+            {% if featured %}<span class="ribbon">Most popular</span>{% endif %}
+            <h3>{{ p['plan_name'] }}</h3>
+            <div class="amt">{{ p['price']|naira }}<span class="per">/ {{ p['duration_days'] }} days</span></div>
+            <div class="small {{ 'opacity-75' if featured else 'text-muted' }} mb-3">≈ {{ monthly|naira }} per month{% if loop.index > 1 %} · save {{ ((1 - monthly / (plans[0]['price'] / (plans[0]['duration_days'] / 30))) * 100)|round|int }}%{% endif %}</div>
+            <ul>
+                <li><i class="bi bi-check-circle-fill"></i> Unlimited JAMB, WAEC &amp; Post-UTME mocks</li>
+                <li><i class="bi bi-check-circle-fill"></i> Unlimited practice with instant explanations</li>
+                <li><i class="bi bi-check-circle-fill"></i> Subject-by-subject analytics</li>
+                <li><i class="bi bi-check-circle-fill"></i> Verified PDF result slips</li>
+                <li><i class="bi bi-check-circle-fill"></i> Leaderboard &amp; bookmarks</li>
+                {% if p['description'] %}<li><i class="bi bi-stars"></i> {{ p['description'] }}</li>{% endif %}
+            </ul>
+            <a href="{{ url_for('subscribe_plan', plan_id=p['id']) }}" class="btn {{ 'btn-accent' if featured else 'btn-primary' }} w-100 mt-auto">Choose {{ p['plan_name'] }}</a>
+        </div>
+    </div>
+    {% else %}
+    <div class="col-12"><div class="pn-empty card"><span class="ico"><i class="bi bi-tags"></i></span><h3>No plans available</h3><p>Please check back soon.</p></div></div>
+    {% endfor %}
+</div>
+
+<div class="card border-0 shadow-sm p-4 mt-4 anim-rise d2">
+    <div class="d-flex align-items-center gap-3 flex-wrap">
+        <span class="pn-stat-icon tint-gold mb-0"><i class="bi bi-people-fill"></i></span>
+        <div class="flex-grow-1">
+            <b>Three children at home?</b>
+            <span class="small text-muted d-block">The Family Plan covers 3 separate accounts with one payment — from ₦2,500 a month, saving up to 25%. Each child gets their own PIN, and you track everything from one page.</span>
+        </div>
+        <a href="{{ url_for('family_page') }}" class="btn btn-accent"><i class="bi bi-people-fill me-1"></i>See the Family Plan</a>
+    </div>
+</div>
+
+<div class="row g-3 mt-4 anim-rise d3">
+    <div class="col-md-4"><div class="pn-feature h-100"><span class="pn-feature-icon tint-green"><i class="bi bi-shield-lock"></i></span><h4>Secure payments</h4><p>Powered by Paystack. Pay with card, bank transfer or USSD — we never see your card details.</p></div></div>
+    <div class="col-md-4"><div class="pn-feature h-100"><span class="pn-feature-icon tint-blue"><i class="bi bi-lightning-charge"></i></span><h4>Instant activation</h4><p>Your plan activates automatically the moment your payment is confirmed.</p></div></div>
+    <div class="col-md-4"><div class="pn-feature h-100"><span class="pn-feature-icon tint-gold"><i class="bi bi-whatsapp"></i></span><h4>Need help?</h4><p>Chat with us on <a href="https://wa.me/{{ support_whatsapp }}" target="_blank" rel="noopener">WhatsApp</a> or email <a href="mailto:{{ support_email }}">{{ support_email }}</a>.</p></div></div>
+</div>
+{% endblock %}
