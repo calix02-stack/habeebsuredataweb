@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""
+PrepNova CBT — one-command installer / updater for PythonAnywhere.
+
+Run this inside a PythonAnywhere *Bash console*:
+
+    curl -sL https://raw.githubusercontent.com/Aduagba90/cbt_app/main/scripts/pythonanywhere_setup.py -o setup.py && python3 setup.py
+
+First run  → asks 3 questions (admin e-mail, admin password, WhatsApp number), then
+             downloads the code, installs packages, writes ~/.prepnova.env, creates the
+             website at https://<username>.pythonanywhere.com, forces HTTPS, reloads.
+Later runs → "update mode": pulls the latest code from GitHub and reloads the website.
+             Students, results, payments and uploaded questions are never touched
+             (the live database lives outside the code folder, in ~/prepnova-data/).
+
+Other commands:
+    python3 setup.py paystack        # add / replace Paystack keys (test or live) and reload
+    python3 setup.py paystack off    # remove Paystack keys (site falls back to manual activation)
+    python3 setup.py reload          # just reload the website
+
+Everything it does is idempotent: running it twice is safe.
+"""
+import getpass
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+REPO = "https://github.com/Aduagba90/cbt_app.git"
+HOME = os.path.expanduser("~")
+CODE = os.path.join(HOME, "cbt_app")
+DATA = os.path.join(HOME, "prepnova-data")
+ENV_FILE = os.path.join(HOME, ".prepnova.env")
+VENV = os.path.join(HOME, ".virtualenvs", "prepnova")
+USER = os.environ.get("USER") or getpass.getuser()
+DOMAIN = f"{USER.lower()}.pythonanywhere.com"
+TOKEN = os.environ.get("API_TOKEN", "")
+HOST = "eu.pythonanywhere.com" if "eu.pythonanywhere.com" in os.environ.get("PYTHONANYWHERE_SITE", "") else "www.pythonanywhere.com"
+API = f"https://{HOST}/api/v0/user/{USER}"
+WSGI = f"/var/www/{USER.lower()}_pythonanywhere_com_wsgi.py"
+
+
+def say(msg):
+    print(f"\n==> {msg}", flush=True)
+
+
+def die(msg):
+    print(f"\n!! {msg}\n", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd, **kw):
+    r = subprocess.run(cmd, shell=True, text=True, capture_output=True, **kw)
+    if r.returncode != 0:
+        die(f"Command failed: {cmd}\n{r.stdout}\n{r.stderr}")
+    return r.stdout
+
+
+def api(method, path, data=None, as_json=False):
+    """Call the PythonAnywhere API. Their endpoints expect classic form-encoded parameters
+    (that is what their own examples use); a few newer ones accept JSON."""
+    headers = {"Authorization": f"Token {TOKEN}"}
+    body = None
+    if data:
+        if as_json:
+            body = json.dumps(data).encode()
+            headers["Content-Type"] = "application/json"
+        else:
+            form = {k: ("true" if v is True else "false" if v is False else v) for k, v in data.items()}
+            body = urllib.parse.urlencode(form).encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(f"{API}{path}", data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode() or "{}"
+            return resp.status, (json.loads(raw) if raw.strip().startswith(("{", "[")) else raw)
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+def check_token():
+    if not TOKEN:
+        die("No API token found.\n"
+            "  Fix: open the 'Account' page → 'API Token' tab → 'Create a new API token',\n"
+            "  then CLOSE this console, open a NEW Bash console and run the command again.")
+
+
+def python_version():
+    v = sys.version_info
+    return f"{v.major}.{v.minor}"
+
+
+def ensure_code():
+    if os.path.isdir(os.path.join(CODE, ".git")):
+        say("Updating code from GitHub")
+        run(f"cd {CODE} && git fetch -q origin && git reset -q --hard origin/main")
+    else:
+        say("Downloading code from GitHub")
+        run(f"git clone -q {REPO} {CODE}")
+
+
+def ensure_venv():
+    if not os.path.exists(os.path.join(VENV, "bin", "python")):
+        say(f"Creating Python {python_version()} environment (one-time)")
+        os.makedirs(os.path.dirname(VENV), exist_ok=True)
+        run(f"python{python_version()} -m venv {VENV}")
+    say("Installing packages (2–4 minutes the first time)")
+    run(f"{VENV}/bin/pip install -q --no-cache-dir -r {CODE}/requirements.txt")
+
+
+def read_env():
+    env = {}
+    if os.path.exists(ENV_FILE):
+        for line in open(ENV_FILE):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
+    return env
+
+
+def write_env(env):
+    order = ["FLASK_ENV", "SECRET_KEY", "APP_URL", "DATABASE_PATH", "SQLITE_JOURNAL_MODE", "ADMIN_EMAIL", "ADMIN_PASSWORD",
+             "SUPPORT_EMAIL", "SUPPORT_WHATSAPP", "SESSION_COOKIE_SECURE", "WAEC_ENABLED",
+             "PAYSTACK_PUBLIC_KEY", "PAYSTACK_SECRET_KEY", "MAIL_USERNAME", "MAIL_PASSWORD"]
+    keys = order + [k for k in env if k not in order]
+    with open(ENV_FILE, "w") as fh:
+        fh.write("# PrepNova CBT settings — edit with the Files tab, then reload the website.\n")
+        fh.write("# Put comments on their own line; text after a value is read as part of it.\n")
+        for k in keys:
+            if k in env:
+                fh.write(f"{k}={env[k]}\n")
+    os.chmod(ENV_FILE, 0o600)
+
+
+def ask(prompt, default=None, secret=False, validate=None):
+    while True:
+        shown = f"{prompt}{f' [{default}]' if default else ''}: "
+        val = (getpass.getpass(shown) if secret else input(shown)).strip()
+        if not val and default:
+            val = default
+        if validate:
+            problem = validate(val)
+            if problem:
+                print(f"   {problem}")
+                continue
+        if val:
+            return val
+
+
+def ensure_env():
+    env = read_env()
+    first = not env
+    if first:
+        say("A few settings (asked only once)")
+        env["ADMIN_EMAIL"] = ask("Admin e-mail (you will log in to /admin_login with this)",
+                                 validate=lambda v: None if re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", v) else "That is not an e-mail address.")
+        env["ADMIN_PASSWORD"] = ask("Admin password, 10+ characters (typing is hidden)", secret=True,
+                                    validate=lambda v: None if len(v) >= 10 and v not in ("admin123", "password") else "Use at least 10 characters, not a default.")
+        env["SUPPORT_WHATSAPP"] = ask("Support WhatsApp number, digits only, e.g. 2348012345678",
+                                      validate=lambda v: None if re.match(r"^234\d{10}$", v) else "Format: 234 followed by 10 digits (no + or spaces).")
+        env["SUPPORT_EMAIL"] = ask("Support e-mail shown to students", default=env["ADMIN_EMAIL"])
+    env.setdefault("FLASK_ENV", "production")
+    env.setdefault("SECRET_KEY", secrets.token_hex(32))
+    env.setdefault("APP_URL", f"https://{DOMAIN}")
+    env.setdefault("DATABASE_PATH", os.path.join(DATA, "database.db"))
+    env.setdefault("SQLITE_JOURNAL_MODE", "DELETE")
+    env.setdefault("SESSION_COOKIE_SECURE", "1")
+    # WAEC opens automatically once genuine WAEC questions exist in the database; this line is
+    # an emergency switch only (set to 0 to force WAEC closed) — keep it at 1.
+    env["WAEC_ENABLED"] = "1"
+    write_env(env)
+    os.makedirs(DATA, exist_ok=True)
+    return env, first
+
+
+def write_wsgi():
+    say("Writing the website start file")
+    os.makedirs(os.path.dirname(WSGI), exist_ok=True)
+    content = f'''# PrepNova CBT — generated by scripts/pythonanywhere_setup.py
+import os, sys
+CODE = "{CODE}"
+if CODE not in sys.path:
+    sys.path.insert(0, CODE)
+os.chdir(CODE)
+
+# Load settings from ~/.prepnova.env (never stored in the code folder)
+with open("{ENV_FILE}") as fh:
+    for line in fh:
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+from app import app as application  # noqa: E402
+'''
+    with open(WSGI, "w") as fh:
+        fh.write(content)
+
+
+def ensure_webapp():
+    """Create the web app if needed and apply its settings. Returns True if it was just created."""
+    status, apps = api("GET", "/webapps/")
+    if status != 200:
+        die(f"Could not talk to PythonAnywhere ({status}): {apps}")
+    existing = [a for a in apps if a.get("domain_name") == DOMAIN]
+    created = False
+    if not existing:
+        if apps:
+            others = ", ".join(a.get("domain_name", "?") for a in apps)
+            die(f"You already have a website ({others}) and free accounts allow only one.\n"
+                f"  Web tab → that website → 'Delete' at the very bottom, then run  python3 setup.py  again.")
+        say(f"Creating the website https://{DOMAIN}")
+        pyver = "python" + python_version().replace(".", "")
+        status, out = api("POST", "/webapps/", {"domain_name": DOMAIN, "python_version": pyver})
+        if status not in (200, 201):
+            die(f"Could not create the website ({status}): {out}")
+        created = True
+        time.sleep(2)
+    say("Applying website settings (code folder, environment, HTTPS)")
+    status, out = api("PATCH", f"/webapps/{DOMAIN}/", {"source_directory": CODE, "virtualenv_path": VENV, "force_https": True})
+    if status not in (200, 201):
+        die(f"Could not configure the website ({status}): {out}")
+    write_wsgi()
+    # Static files served directly by the web server (faster, no Python needed)
+    status, mappings = api("GET", f"/webapps/{DOMAIN}/static_files/")
+    if status == 200 and not any(m.get("url") == "/static/" for m in mappings):
+        st, out = api("POST", f"/webapps/{DOMAIN}/static_files/", {"url": "/static/", "path": os.path.join(CODE, "static")})
+        if st not in (200, 201):
+            api("POST", f"/webapps/{DOMAIN}/static_files/", {"url": "/static/", "path": os.path.join(CODE, "static")}, as_json=True)
+    return created
+
+
+def reload_site():
+    say("Reloading the website")
+    status, out = api("POST", f"/webapps/{DOMAIN}/reload/")
+    if status not in (200, 201):
+        die(f"Reload failed ({status}): {out}")
+    time.sleep(4)
+    try:
+        with urllib.request.urlopen(f"https://{DOMAIN}/health", timeout=60) as r:
+            ok = json.loads(r.read().decode()).get("ok")
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        print(f"   (health check did not answer yet: {exc})")
+    return ok
+
+
+def cmd_paystack(turn_off=False):
+    env = read_env()
+    if not env:
+        die("Run  python3 setup.py  first (the site has not been installed yet).")
+    if turn_off:
+        env.pop("PAYSTACK_PUBLIC_KEY", None)
+        env.pop("PAYSTACK_SECRET_KEY", None)
+        write_env(env)
+        reload_site()
+        print("\nPaystack keys removed. Students now see 'contact support on WhatsApp' and you activate plans in Admin.\n")
+        return
+    say("Paystack keys  (Paystack dashboard → Settings → API Keys & Webhooks)")
+    print("   TEST keys start with pk_test_/sk_test_  → pretend money, for testing.")
+    print("   LIVE keys start with pk_live_/sk_live_  → real money, after Paystack approves your business.")
+    pub = ask("Public key", validate=lambda v: None if re.match(r"^pk_(test|live)_[A-Za-z0-9]{20,}$", v) else "Should start with pk_test_ or pk_live_ followed by the long code.")
+    sec = ask("Secret key (typing is hidden)", secret=True,
+              validate=lambda v: None if re.match(r"^sk_(test|live)_[A-Za-z0-9]{20,}$", v) else "Should start with sk_test_ or sk_live_ followed by the long code.")
+    if pub[3:7] != sec[3:7]:
+        die("One key is TEST and the other is LIVE. Copy both from the same mode (the Test-mode switch at the top of the Paystack dashboard).")
+    env["PAYSTACK_PUBLIC_KEY"] = pub
+    env["PAYSTACK_SECRET_KEY"] = sec
+    write_env(env)
+    reload_site()
+    mode = "TEST" if pub.startswith("pk_test_") else "LIVE"
+    domain = env.get("APP_URL", f"https://{DOMAIN}")
+    print("\n" + "=" * 64)
+    print(f"  Paystack {mode} keys saved and the website reloaded.")
+    print(f"  Open {domain}/subscribe — the Pay buttons are now active.")
+    if mode == "TEST":
+        print("  Test card: 4084 0840 8408 4081, CVV 408, any future expiry,")
+        print("  PIN 0000 if asked, OTP 123456.  No real money moves.")
+    else:
+        print(f"  In Paystack set Webhook URL to {domain}/paystack/webhook")
+        print(f"  and Callback URL to {domain}/payment_callback.")
+    print("=" * 64 + "\n")
+
+
+def cmd_waec():
+    """Open WAEC: make sure the settings switch is on, reload, then check the live page."""
+    say("Checking the WAEC switch in your settings file")
+    env = read_env()
+    if not env:
+        die("Run  python3 setup.py  first (the site has not been installed yet).")
+    before = env.get("WAEC_ENABLED", "(missing)")
+    if before == "1":
+        print("   The switch is already on (WAEC_ENABLED=1).")
+    else:
+        print(f"   The switch was OFF (WAEC_ENABLED={before}). Turning it on.")
+        env["WAEC_ENABLED"] = "1"
+        write_env(env)
+    ok = reload_site()
+    print("   Waiting for the site to come back up...")
+    time.sleep(20)
+    try:
+        with urllib.request.urlopen(f"https://{DOMAIN}/", timeout=60) as r:
+            page = r.read().decode(errors="ignore")
+        open_now = "Real WASSCE objective papers" in page
+    except Exception as exc:  # noqa: BLE001
+        open_now = False
+        print(f"   (could not check the live page yet: {exc})")
+    print("\n" + "=" * 64)
+    if open_now:
+        print("  WAEC is now OPEN on the live site.")
+        print(f"  Open https://{DOMAIN}  →  Log in  →  WAEC / SSCE — English is there.")
+    else:
+        print("  WAEC is still showing 'coming soon'.")
+        print("  Send this whole screen to your developer.")
+    print("=" * 64 + "\n")
+
+
+def main():
+    args = sys.argv[1:]
+    if args:
+        check_token()
+        if args[0] == "paystack":
+            cmd_paystack(turn_off=(len(args) > 1 and args[1].lower() == "off"))
+        elif args[0] == "reload":
+            ok = reload_site()
+            print("Reloaded." if ok else "Reloaded, but /health did not answer yet — wait a minute and open the site.")
+        elif args[0] == "waec":
+            cmd_waec()
+        else:
+            die(f"Unknown command '{args[0]}'. Use:  python3 setup.py  |  python3 setup.py paystack  |  python3 setup.py paystack off  |  python3 setup.py reload  |  python3 setup.py waec")
+        return
+    if "PYTHONANYWHERE_DOMAIN" not in os.environ and "PYTHONANYWHERE_SITE" not in os.environ:
+        die("Run this inside a PythonAnywhere Bash console (Consoles tab → Bash).")
+    check_token()
+    if shutil.which("git") is None:
+        die("git is not available in this console.")
+    env, first = ensure_env()
+    ensure_code()
+    ensure_venv()
+    created = ensure_webapp()
+    ok = reload_site()
+
+    print("\n" + "=" * 64)
+    if ok:
+        print(f"  DONE.  Your site is live at:  https://{DOMAIN}")
+    else:
+        print(f"  Finished, but https://{DOMAIN}/health did not answer yet.")
+        print("  Wait one minute and open the address. If it still fails, open the")
+        print("  Web tab → 'Error log' and send the last red lines to your developer.")
+    if first or created:
+        print(f"  Admin login:  https://{DOMAIN}/admin_login   ({env['ADMIN_EMAIL']})")
+        print(f"  Settings file: {ENV_FILE}   (Paystack keys go here later)")
+        print(f"  Database:      {env['DATABASE_PATH']}   (back it up from Admin → Backup)")
+    else:
+        print("  Code updated from GitHub and website reloaded. Data untouched.")
+    print("  Free accounts: press the 'Run until 3 months from today' button on the")
+    print("  Web tab whenever it appears, or the site is switched off.")
+    print("=" * 64 + "\n")
+
+
+if __name__ == "__main__":
+    main()
