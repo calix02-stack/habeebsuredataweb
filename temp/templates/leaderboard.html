@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Leaderboard{% endblock %}
+
+{% block content %}
+<div class="pn-page-head anim-rise">
+    <div>
+        <div class="pn-breadcrumb"><a href="{{ url_for('dashboard') }}">Dashboard</a><i class="bi bi-chevron-right"></i><span>Leaderboard</span></div>
+        <h1>Leaderboard</h1>
+        <p class="lead">Ranked by average score across completed mocks. Emails are masked to protect privacy.</p>
+    </div>
+    <div class="btn-group btn-group-sm" role="group">
+        {% for key, label in [('week', 'This week'), ('month', 'This month'), ('all', 'All time')] %}
+        <a href="{{ url_for('leaderboard', period=key) }}" class="btn {{ 'btn-primary' if period == key else 'btn-outline-primary' }}">{{ label }}</a>
+        {% endfor %}
+    </div>
+</div>
+
+{% if my_rank %}
+<div class="alert alert-primary d-flex align-items-center gap-3 anim-rise"><span class="pn-stat-icon tint-blue"><i class="bi bi-trophy"></i></span><div>You are ranked <b>#{{ my_rank }}</b> {{ 'this week' if period == 'week' else ('this month' if period == 'month' else 'overall') }}. Keep it up!</div></div>
+{% elif rows %}
+<div class="alert alert-light border d-flex align-items-center gap-3 anim-rise"><span class="pn-stat-icon tint-gold"><i class="bi bi-stars"></i></span><div>Complete a full mock (10+ questions) to appear on the board.</div></div>
+{% endif %}
+
+{% if rows %}
+<!-- Podium -->
+{% if rows|length >= 3 %}
+<div class="pn-podium anim-rise d1">
+    {% for pos, i in [(2, 1), (1, 0), (3, 2)] %}
+    {% set r = rows[i] %}
+    <div class="pn-podium-item p{{ pos }} {{ 'me' if r['username'] == me }}">
+        <span class="pn-avatar {{ 'gold' if pos == 1 else ('silver' if pos == 2 else 'bronze') }}">{{ initials(r['name']) }}</span>
+        <div class="fw-bold text-truncate" style="max-width:150px">{{ (r['name'] or mask_email(r['username'])).split(' ')[0] }}</div>
+        <div class="small text-muted">{{ r['avg_pct'] }}% avg</div>
+        <div class="pn-podium-bar">#{{ pos }}</div>
+    </div>
+    {% endfor %}
+</div>
+{% endif %}
+
+<div class="card anim-rise d2">
+    <div class="table-responsive">
+        <table class="table pn-table align-middle mb-0">
+            <thead><tr><th style="width:60px">Rank</th><th>Student</th><th class="text-center">Exams</th><th class="text-center">Average</th><th class="text-center d-none d-sm-table-cell">Best</th></tr></thead>
+            <tbody>
+                {% for r in rows %}
+                <tr class="{{ 'table-primary' if r['username'] == me }}">
+                    <td><span class="pn-rank {{ 'top' if loop.index <= 3 }}">{{ loop.index }}</span></td>
+                    <td><div class="d-flex align-items-center gap-2"><span class="pn-avatar sm">{{ initials(r['name']) }}</span><div><div class="fw-semibold">{{ r['name'] or 'Student' }}{% if r['username'] == me %} <span class="badge bg-primary ms-1">You</span>{% endif %}</div><div class="small text-muted">{{ mask_email(r['username']) }}</div></div></div></td>
+                    <td class="text-center">{{ r['exams'] }}</td>
+                    <td class="text-center"><b>{{ r['avg_pct'] }}%</b></td>
+                    <td class="text-center d-none d-sm-table-cell">{{ r['best'] }}%</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% else %}
+<div class="pn-empty card anim-rise"><span class="ico"><i class="bi bi-trophy"></i></span><h3>No scores in this period yet</h3><p>Be the first — complete a mock exam and claim the top spot.</p><a href="{{ url_for('exam_types') }}" class="btn btn-primary">Take a mock</a></div>
+{% endif %}
+{% endblock %}

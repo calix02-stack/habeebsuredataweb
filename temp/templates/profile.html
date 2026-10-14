@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}My profile{% endblock %}
+
+{% block content %}
+<div class="pn-page-head anim-rise">
+    <div>
+        <div class="pn-breadcrumb"><a href="{{ url_for('dashboard') }}">Dashboard</a><i class="bi bi-chevron-right"></i><span>Profile</span></div>
+        <h1>My profile</h1>
+        <p class="lead">Manage your details, subscription and signed-in devices.</p>
+    </div>
+    <div class="d-flex gap-2"><a href="{{ url_for('edit_profile') }}" class="btn btn-primary"><i class="bi bi-pencil me-1"></i> Edit profile</a><a href="{{ url_for('change_password') }}" class="btn btn-outline-primary"><i class="bi bi-key me-1"></i> Password</a></div>
+</div>
+
+<div class="row g-4">
+    <div class="col-lg-4">
+        <div class="card anim-rise text-center">
+            <div class="card-body py-4">
+                <span class="pn-avatar xl mx-auto mb-3">{{ initials(user['name']) }}</span>
+                <h2 class="h4 mb-1">{{ user['name'] }}</h2>
+                <div class="text-muted small">{{ user['email'] }}</div>
+                <div class="d-flex justify-content-center gap-2 mt-3 flex-wrap">
+                    <span class="badge bg-light text-dark border"><i class="bi bi-calendar3 me-1"></i>Joined {{ user['date_joined']|nicedate('%b %Y') }}</span>
+                    <span class="badge {{ 'bg-success' if user['status'] == 'active' else 'bg-danger' }}">{{ user['status']|capitalize }}</span>
+                </div>
+            </div>
+            <ul class="list-group list-group-flush text-start small">
+                <li class="list-group-item d-flex justify-content-between"><span class="text-muted">Phone</span><b>{{ user['phone'] or '—' }}</b></li>
+                <li class="list-group-item d-flex justify-content-between"><span class="text-muted">School</span><b class="text-end">{{ user['school'] or '—' }}</b></li>
+                <li class="list-group-item d-flex justify-content-between"><span class="text-muted">State</span><b>{{ user['state_of_origin'] or '—' }}</b></li>
+                <li class="list-group-item d-flex justify-content-between"><span class="text-muted">Last login</span><b>{{ user['last_login']|nicedate('%d %b, %I:%M %p') }}</b></li>
+            </ul>
+        </div>
+
+        <div class="pn-plan-box mt-3 anim-rise d1 {{ 'active' if sub.active }}">
+            <div class="d-flex justify-content-between align-items-center mb-2"><span class="text-uppercase ls-1 small fw-bold opacity-75">Subscription</span><span class="badge {{ 'bg-success' if sub.active else 'bg-secondary' }}">{{ sub.status }}</span></div>
+            <div class="h5 mb-1">{{ sub.plan }}{% if sub.is_trial %} <span class="badge bg-warning text-dark">Trial</span>{% endif %}</div>
+            {% if sub.active %}
+            <div class="small opacity-75 mb-2">{{ sub.days_left }} day{{ '' if sub.days_left == 1 else 's' }} left · expires {{ sub.end_date|nicedate }}</div>
+            <div class="progress mb-3" style="height:6px"><div class="progress-bar bg-warning" style="width:{{ sub.progress }}%"></div></div>
+            <a href="{{ url_for('subscribe') }}" class="btn btn-accent btn-sm w-100">{{ 'Upgrade to a paid plan' if sub.is_trial else 'Extend subscription' }}</a>
+            {% else %}
+            <p class="small opacity-75 mb-3">No active plan. Subscribe to unlock unlimited mocks and practice.</p>
+            <a href="{{ url_for('subscribe') }}" class="btn btn-accent btn-sm w-100">View plans</a>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="col-lg-8">
+        <div class="card anim-rise d1">
+            <div class="card-header d-flex justify-content-between align-items-center"><span><i class="bi bi-shield-lock me-2 text-primary"></i>Signed-in devices</span><span class="small text-muted">{{ sessions|length }} active</span></div>
+            <ul class="list-group list-group-flush">
+                {% for s in sessions %}
+                {% set ua = (s['user_agent'] or '') %}
+                {% set is_mobile = 'Mobile' in ua or 'Android' in ua or 'iPhone' in ua %}
+                <li class="list-group-item d-flex align-items-center gap-3">
+                    <span class="pn-stat-icon {{ 'tint-green' if s['session_token'] == current_token else 'tint-blue' }}"><i class="bi {{ 'bi-phone' if is_mobile else 'bi-laptop' }}"></i></span>
+                    <div class="flex-grow-1 min-w-0">
+                        <div class="fw-semibold">{{ 'Android' if 'Android' in ua else ('iPhone' if 'iPhone' in ua else ('Windows' if 'Windows' in ua else ('Mac' if 'Mac' in ua else 'Device'))) }} · {{ 'Chrome' if 'Chrome' in ua and 'Edg' not in ua else ('Edge' if 'Edg' in ua else ('Safari' if 'Safari' in ua else ('Firefox' if 'Firefox' in ua else 'Browser'))) }}{% if s['session_token'] == current_token %} <span class="badge bg-success ms-1">This device</span>{% endif %}</div>
+                        <div class="small text-muted">IP {{ s['ip_address'] or '—' }} · last active {{ s['last_activity']|nicedate('%d %b, %I:%M %p') }}</div>
+                    </div>
+                    {% if s['session_token'] != current_token %}
+                    <form method="POST" action="{{ url_for('logout_session', session_id=s['id']) }}"><input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token() }}"><button class="btn btn-sm btn-outline-danger" data-confirm="Sign out this device?">Sign out</button></form>
+                    {% endif %}
+                </li>
+                {% else %}
+                <li class="list-group-item text-muted small">No other active sessions.</li>
+                {% endfor %}
+            </ul>
+            <div class="card-footer small text-muted"><i class="bi bi-info-circle me-1"></i>For security, PrepNova allows one active login at a time — signing in on a new device signs out the old one.</div>
+        </div>
+
+        <div class="card mt-4 anim-rise d2">
+            <div class="card-header"><i class="bi bi-receipt me-2 text-primary"></i>Payment history</div>
+            {% if payments %}
+            <div class="table-responsive">
+                <table class="table pn-table align-middle mb-0">
+                    <thead><tr><th>Plan</th><th>Amount</th><th>Status</th><th class="d-none d-md-table-cell">Reference</th><th>Date</th></tr></thead>
+                    <tbody>
+                        {% for p in payments %}
+                        <tr>
+                            <td class="fw-semibold">{{ p['plan_name'] }}</td>
+                            <td>{{ p['amount']|naira }}</td>
+                            <td><span class="badge {{ 'bg-success' if p['payment_status'] in ('SUCCESS', 'success', 'PAID') else ('bg-warning text-dark' if p['payment_status'] == 'PENDING' else 'bg-danger') }}">{{ p['payment_status'] }}</span></td>
+                            <td class="d-none d-md-table-cell"><code class="small">{{ p['transaction_reference'] }}</code></td>
+                            <td class="text-muted small">{{ p['created_at']|nicedate('%d %b %Y') }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <div class="card-body text-muted small">No payments yet.</div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}

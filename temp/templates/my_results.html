@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}My results{% endblock %}
+
+{% block content %}
+<div class="pn-page-head anim-rise">
+    <div>
+        <div class="pn-breadcrumb"><a href="{{ url_for('dashboard') }}">Dashboard</a><i class="bi bi-chevron-right"></i><span>My results</span></div>
+        <h1>My results</h1>
+        <p class="lead">Every mock you have completed, newest first.</p>
+    </div>
+    {% if results %}
+    <div class="btn-group btn-group-sm" role="group" id="typeFilter">
+        <button class="btn btn-primary" data-type="">All</button>
+        {% for t in ['JAMB', 'WAEC', 'POST-UTME'] %}<button class="btn btn-outline-primary" data-type="{{ t }}">{{ t }}</button>{% endfor %}
+    </div>
+    {% endif %}
+</div>
+
+{% if results %}
+<div class="card anim-rise d1">
+    <div class="table-responsive">
+        <table class="table pn-table align-middle mb-0" id="resultsTable">
+            <thead><tr><th>Exam</th><th class="d-none d-md-table-cell">Date</th><th>Score</th><th class="d-none d-sm-table-cell">Status</th><th class="d-none d-lg-table-cell">Time</th><th class="text-end">Actions</th></tr></thead>
+            <tbody>
+                {% for r in results %}
+                {% set pct = (r['percentage'] or 0)|int %}
+                <tr data-type="{{ r['exam_type'] }}">
+                    <td><div class="fw-semibold">{{ r['exam_name'] or r['exam_type'] }}</div><div class="small text-muted">{{ r['exam_type'] }}{% if r['jamb_score'] is not none %} · {{ r['jamb_score'] }}/400{% endif %}</div><div class="small text-muted d-md-none">{{ r['date_taken']|nicedate('%d %b %Y') }}</div></td>
+                    <td class="d-none d-md-table-cell text-muted">{{ r['date_taken']|nicedate('%d %b %Y, %I:%M %p') }}</td>
+                    <td><div class="d-flex align-items-center gap-2"><div class="progress flex-grow-1 d-none d-sm-block" style="height:8px;min-width:70px"><div class="progress-bar {{ 'bg-success' if pct >= 70 else ('bg-warning' if pct >= 50 else 'bg-danger') }}" style="width:{{ pct }}%"></div></div><b>{{ pct }}%</b><span class="small text-muted">({{ r['score'] }}/{{ r['total'] }})</span></div></td>
+                    <td class="d-none d-sm-table-cell"><span class="badge {{ 'bg-success' if r['status'] == 'PASS' else ('bg-warning text-dark' if r['status'] == 'AVERAGE' else 'bg-danger') }}">{{ r['status'] or '—' }}</span></td>
+                    <td class="d-none d-lg-table-cell text-muted">{{ fmt_duration(r['duration']) }}</td>
+                    <td class="text-end text-nowrap">
+                        <a href="{{ url_for('result_details', result_id=r['id']) }}" class="btn btn-sm btn-outline-primary" title="Details"><i class="bi bi-eye"></i></a>
+                        <a href="{{ url_for('review_answers', result_id=r['id']) }}" class="btn btn-sm btn-outline-secondary" title="Corrections"><i class="bi bi-journal-check"></i></a>
+                        <a href="{{ url_for('download_my_result', result_id=r['id']) }}" class="btn btn-sm btn-outline-secondary d-none d-md-inline-block" title="PDF"><i class="bi bi-file-earmark-pdf"></i></a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% else %}
+<div class="pn-empty card anim-rise"><span class="ico"><i class="bi bi-clipboard-data"></i></span><h3>No results yet</h3><p>Take your first mock exam and your scores will appear here.</p><a href="{{ url_for('exam_types') }}" class="btn btn-primary">Start a mock exam</a></div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    var f = document.getElementById('typeFilter'); if (!f) return;
+    f.addEventListener('click', function(e){
+        var b = e.target.closest('button'); if (!b) return;
+        f.querySelectorAll('button').forEach(function(x){ x.classList.remove('btn-primary'); x.classList.add('btn-outline-primary'); });
+        b.classList.add('btn-primary'); b.classList.remove('btn-outline-primary');
+        var t = b.dataset.type;
+        document.querySelectorAll('#resultsTable tbody tr').forEach(function(tr){ tr.classList.toggle('d-none', !!t && tr.dataset.type !== t); });
+    });
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% from "_share.html" import share_row %}
+{% block title %}{{ p['title'] }}{% endblock %}
+{% block og_title %}{{ p['title'] }} — instant download{% endblock %}
+{% block og_description %}{{ p['blurb'] }} {{ p['price']|naira }} one-time — instant download, no account needed.{% endblock %}
+{% block og_image %}{{ request.url_root.rstrip('/') }}{{ url_for('static', filename='img/share-novels.png') }}{% endblock %}
+{% block description %}{{ p['blurb'] }} Instant download after payment — {% if p['slug'].startswith('offline-') %}a single file that works offline on your phone or laptop.{% else %}printable PDF for JAMB and WAEC preparation.{% endif %}{% endblock %}
+
+{% block content %}
+<div class="pn-page-head anim-rise">
+    <div>
+        <div class="pn-breadcrumb"><a href="{{ url_for('shop') }}">Study shop</a><i class="bi bi-chevron-right"></i><span>{{ p['title'] }}</span></div>
+        {% if badges.get(p['slug']) %}<span class="badge rounded-pill bg-{{ badges[p['slug']][1] }} bg-opacity-10 text-{{ badges[p['slug']][1] }}-emphasis mb-2"><i class="bi bi-award me-1"></i>{{ badges[p['slug']][0] }}</span>{% endif %}
+        <h1>{{ '📴' if p['slug'].startswith('offline-') else '📘' }} {{ p['title'] }}</h1>
+        <p class="lead">{{ p['blurb'] }}</p>
+    </div>
+</div>
+
+<div class="row g-4">
+    <div class="col-lg-7">
+        <div class="card border-0 shadow-sm p-4 anim-rise">
+            <h2 class="h5 mb-3">What's inside</h2>
+            <ul class="mb-0" style="line-height:2">
+                {% for d in details %}
+                <li><i class="bi bi-check-circle-fill text-success me-1"></i> {{ d }}</li>
+                {% endfor %}
+            </ul>
+            {% if p['slug'] == 'offline-jamb-cbt' %}
+            <p class="small text-muted mt-3 mb-0"><i class="bi bi-arrow-right me-1"></i>Also available: <a href="{{ url_for('product_page', slug='offline-waec-cbt') }}">PrepNova Offline — WAEC Exam Simulator</a> — every WAEC objective paper, same offline magic.</p>
+            {% elif p['slug'] == 'offline-waec-cbt' %}
+            <p class="small text-muted mt-3 mb-0"><i class="bi bi-arrow-right me-1"></i>Also available: <a href="{{ url_for('product_page', slug='offline-jamb-cbt') }}">PrepNova Offline — JAMB CBT Simulator</a> — the full JAMB mock, same offline magic.</p>
+            {% endif %}
+        </div>
+    </div>
+    <div class="col-lg-5">
+        {% if sub_free %}
+        <div class="card border-0 shadow-sm p-4 anim-rise mb-4 border-start border-4 border-success">
+            <div class="d-flex align-items-center gap-2 mb-2">
+                <i class="bi bi-stars text-success fs-4"></i>
+                <h2 class="h5 mb-0">Free for you — active subscriber 🎉</h2>
+            </div>
+            <p class="small text-muted mb-3">The Offline Simulator is included with every active PrepNova subscription. Claim your copy — same file, no payment.</p>
+            <form method="POST" action="{{ url_for('offline_free') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="slug" value="{{ p['slug'] }}">
+                <button type="submit" class="btn btn-success btn-lg w-100" data-loading="Preparing…"><i class="bi bi-download me-1"></i>Download free</button>
+            </form>
+            <p class="text-center small text-muted mt-2 mb-0">Not subscribed? Buy it below for {{ p['price']|naira }} one-time.</p>
+        </div>
+        {% endif %}
+        <form method="POST" action="{{ url_for('shop_buy') }}" data-once class="card border-0 shadow-sm p-4 anim-rise d1">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="slug" value="{{ p['slug'] }}">
+            <div class="text-center mb-3">
+                <span class="fs-2 fw-bold text-primary" id="totalPrice">{{ p['price']|naira }}</span>
+                <div class="small text-muted">one-time payment · instant download</div>
+            </div>
+            <div class="mb-3">
+                <label class="form-label small mb-1">Promo code (optional)</label>
+                <div class="d-flex gap-2">
+                    <input class="form-control form-control-sm text-uppercase" name="promo_code" id="promoCode" placeholder="CODE" maxlength="24" autocomplete="off" style="max-width:140px">
+                    <button type="button" class="btn btn-sm btn-outline-primary" id="promoBtn">Apply</button>
+                </div>
+                <div class="small mt-1" id="promoMsg"></div>
+            </div>
+            <div class="mb-3">
+                <label class="form-label">Your name</label>
+                <input class="form-control" name="buyer_name" maxlength="60" required placeholder="e.g. Mrs. Bello">
+            </div>
+            <div class="mb-3">
+                <label class="form-label">Your email</label>
+                <input type="email" class="form-control" name="buyer_email" maxlength="80" required placeholder="you@example.com">
+                <div class="form-text">The download link is sent here too.</div>
+            </div>
+            {% if paystack_ready %}
+            <button type="submit" class="btn btn-accent btn-lg w-100" data-loading="Preparing…"><i class="bi bi-lock-fill me-1"></i>Pay &amp; download now</button>
+            <p class="text-center small text-muted mt-2 mb-0">Card, transfer or USSD via Paystack · download link valid {{ 14 }} days, up to 5 downloads.</p>
+            {% else %}
+            <div class="alert alert-warning small mb-0"><i class="bi bi-exclamation-triangle me-1"></i>Online payment is being set up — contact support on <a href="https://wa.me/{{ support_whatsapp }}" target="_blank" rel="noopener">WhatsApp</a>.</div>
+            {% endif %}
+            <div class="text-center mt-3">{{ share_row(request.url_root.rstrip('/') ~ url_for('product_page', slug=p['slug']), p['title'] ~ ' — complete study pack, instant download:') }}</div>
+        </form>
+    </div>
+</div>
+<script>
+(function () {
+    var btn = document.getElementById('promoBtn'), code = document.getElementById('promoCode'),
+        msg = document.getElementById('promoMsg'), total = document.getElementById('totalPrice'), base = {{ p['price'] }};
+    btn.addEventListener('click', function () {
+        var c = code.value.trim();
+        if (!c) { msg.textContent = ''; return; }
+        fetch('/promo/check?code=' + encodeURIComponent(c) + '&amount=' + base + '&scope=shop')
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (d.ok) {
+                    msg.innerHTML = '<span class="text-success"><i class="bi bi-check-circle-fill"></i> ' + d.message + '</span>';
+                    total.textContent = '₦' + Number(d.total).toLocaleString('en-NG', {maximumFractionDigits: 0});
+                } else {
+                    msg.innerHTML = '<span class="text-danger"><i class="bi bi-x-circle-fill"></i> ' + (d.message || 'Code not valid') + '</span>';
+                    total.textContent = '₦' + Number(base).toLocaleString('en-NG', {maximumFractionDigits: 0});
+                }
+            });
+    });
+})();
+</script>
+{% endblock %}

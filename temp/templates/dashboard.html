@@ -1,0 +1,244 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+
+{% block content %}
+{% set first = (name or 'Student').split(' ')[0] %}
+
+{% if open_attempt %}
+<div class="alert alert-warning d-flex flex-wrap align-items-center justify-content-between gap-2 mb-4 anim-rise" style="border-left:4px solid var(--pn-warning)">
+    <div class="d-flex align-items-center gap-2"><i class="bi bi-hourglass-split fs-5"></i><div><b>You have an exam in progress:</b> {{ open_attempt['exam_type'] }} — {{ open_attempt['exam_name'] }}. Your timer is still running.</div></div>
+    <div class="d-flex gap-2">
+        <a href="{{ url_for('exam_room', attempt_id=open_attempt['id']) }}" class="btn btn-warning btn-sm fw-bold"><i class="bi bi-play-fill"></i> Resume now</a>
+        <form method="POST" action="{{ url_for('abandon_exam') }}"><input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token() }}"><button class="btn btn-outline-secondary btn-sm" data-confirm="Discard this unfinished exam? It will not be graded.">Discard</button></form>
+    </div>
+</div>
+{% endif %}
+
+<!-- Welcome + subscription -->
+<div class="row g-3 mb-4">
+    <div class="col-lg-8">
+        <div class="pn-welcome h-100 anim-rise">
+            <div class="d-flex flex-wrap justify-content-between align-items-start gap-3">
+                <div>
+                    <span class="badge bg-primary mb-2"><i class="bi bi-hand-thumbs-up me-1"></i>Welcome back</span>
+                    <h1>Hello, {{ first }} 👋</h1>
+                    <p class="mb-3">{% if streak_days >= 2 %}You are on a <b>{{ streak_days }}-day study streak</b> 🔥 — don't break it today.{% elif streak_days == 1 %}You studied today — come back tomorrow to start a streak.{% else %}Do one mock or practice set today to start your study streak.{% endif %} {% if rank %}You currently rank <b>#{{ rank }}</b> among all students.{% else %}Write your first mock to join the leaderboard.{% endif %}</p>
+                    <div class="d-flex flex-wrap gap-2">
+                        <a href="{{ url_for('exam_types') }}" class="btn btn-primary"><i class="bi bi-pencil-square me-1"></i> Start mock exam</a>
+                        <a href="{{ url_for('practice') }}" class="btn btn-outline-primary"><i class="bi bi-lightning-charge me-1"></i> Quick practice</a>
+                    </div>
+                </div>
+                <div class="pn-target">
+                    {% if projection %}
+                    <div class="pn-target-ring pn-score-ring" style="--p:{{ (100 * projection / (target or 400))|int if (target or 400) else 0 }};--c:{{ 'var(--pn-success)' if (target and projection >= target) or (not target and projection >= 280) else ('var(--pn-warning)' if projection >= 200 else 'var(--pn-danger)') }};width:112px;height:112px">
+                        <div><b style="font-size:1.35rem">{{ projection }}</b><small>projected /400</small></div>
+                    </div>
+                    {% endif %}
+                    <form method="POST" action="{{ url_for('set_target') }}" class="pn-target-form">
+                        <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token() }}">
+                        <label class="small text-muted fw-semibold" for="targetInput">{% if target %}My target{% else %}Set my UTME target{% endif %}</label>
+                        <div class="input-group input-group-sm">
+                            <input id="targetInput" type="number" class="form-control" name="target" min="100" max="400" step="5" value="{{ target or 280 }}" inputmode="numeric">
+                            <span class="input-group-text">/400</span>
+                            <button class="btn btn-outline-primary" type="submit">{{ 'Update' if target else 'Save' }}</button>
+                        </div>
+                        {% if target and projection %}<div class="small mt-1 {{ 'text-success' if projection >= target else 'text-muted' }}">{% if projection >= target %}On target 🎯{% else %}{{ target - projection }} marks to go — projection = last 3 mocks.{% endif %}</div>{% elif target %}<div class="small mt-1 text-muted">Write a full JAMB mock to see your projection.</div>{% endif %}
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-lg-4">
+        <div class="pn-plan-box anim-rise d1">
+            <div class="d-flex justify-content-between align-items-start">
+                <div><div class="lbl">Current plan</div><div class="val">{{ sub.plan }}</div></div>
+                <span class="badge {{ 'bg-success' if sub.active else 'bg-danger' }}">{{ sub.status }}</span>
+            </div>
+            {% if sub.active %}
+                <div class="d-flex justify-content-between small mt-3 mb-1" style="color:rgba(255,255,255,.75)"><span>{{ sub.days_left }} day{{ '' if sub.days_left == 1 else 's' }} left</span><span>Expires {{ fmt_date(sub.end_date) }}</span></div>
+                <div class="progress"><div class="progress-bar" style="width:{{ sub.progress }}%"></div></div>
+                {% if sub.days_left <= 7 %}<div class="small mt-2" style="color:#fde68a"><i class="bi bi-exclamation-triangle-fill me-1"></i>{{ 'Your free trial' if sub.is_trial else 'Your plan' }} ends soon.</div>{% endif %}
+                {% if sub.active and not sub.is_trial %}
+                {% if sub.auto_renew %}
+                <div class="small mt-2 d-flex align-items-center justify-content-between gap-2 flex-wrap" style="color:#a7f3d0">
+                    <span><i class="bi bi-arrow-repeat me-1"></i>Auto-renewal ON{% if sub.card_last4 %} — {{ sub.card_bank or 'card' }} ••{{ sub.card_last4 }}{% endif %}</span>
+                    <form method="POST" action="{{ url_for('auto_renew_toggle') }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="hidden" name="action" value="off">
+                        <button class="btn btn-sm btn-outline-light py-0 px-2" style="font-size:.72rem">Turn off</button>
+                    </form>
+                </div>
+                {% else %}
+                <div class="small mt-2" style="color:rgba(255,255,255,.6)"><i class="bi bi-arrow-repeat me-1"></i>Auto-renewal off — tick "Renew automatically" at checkout to never lose access.</div>
+                {% endif %}
+                {% endif %}
+            {% else %}
+                <p class="small mt-3 mb-2" style="color:rgba(255,255,255,.8)">Your access has expired. Subscribe to continue writing full mock exams.</p>
+            {% endif %}
+            <a href="{{ url_for('subscribe') }}" class="btn btn-accent w-100 mt-3"><i class="bi bi-gem me-1"></i> {{ 'Extend plan' if sub.active else 'Choose a plan' }}</a>
+            <a href="{{ url_for('subscribe', pin=1) }}#pin" class="btn btn-sm w-100 mt-2 pn-pin-link"><i class="bi bi-ticket-perforated me-1"></i> I have an Access PIN</a>
+        </div>
+    </div>
+</div>
+
+<!-- Countdown · Live Mock · Syllabus -->
+<div class="row g-3 mb-4">
+    <div class="col-md-6 col-xl-4">
+        <a href="{{ url_for('study_plan') }}" class="pn-boost pn-boost-countdown anim-rise {{ 'urgent' if days_left is not none and 0 <= days_left <= 14 }}">
+            <span class="pn-boost-icon"><i class="bi bi-calendar-event"></i></span>
+            <span class="pn-boost-body">
+                <b>{% if days_left is none %}Set your exam date{% elif days_left < 0 %}Exam written — update your date{% elif days_left == 0 %}Exam day is today. Good luck!{% else %}{{ days_left }} day{{ '' if days_left == 1 else 's' }} to your UTME{% endif %}</b>
+                <small>{% if days_left is none %}Get a countdown and a weekly study plan built from your results.{% else %}Open your weekly plan: what to practise and when to write mocks.{% endif %}</small>
+            </span>
+            <span class="pn-boost-cta">{{ 'Plan' if days_left is not none else 'Set' }} <i class="bi bi-arrow-right"></i></span>
+        </a>
+    </div>
+    <div class="col-md-6 col-xl-4">
+        <a href="{{ url_for('live_mock') }}" class="pn-boost pn-boost-live anim-rise d1 {{ 'is-open' if live_win.state == 'open' }}">
+            <span class="pn-boost-icon"><i class="bi bi-broadcast"></i></span>
+            <span class="pn-boost-body">
+                <b>{% if live_win.state == 'open' %}{% if live_mine and live_mine['status'] == 'IN_PROGRESS' %}Live Mock in progress — resume{% elif live_mine %}Live Mock done — see your rank{% else %}Live Mock is open now{% endif %}{% else %}Saturday Live Mock · {{ live_win.saturday.strftime('%d %b') }}{% endif %}</b>
+                <small>{% if live_win.state == 'open' %}Same paper for everyone today, 8 am – 8 pm. Ranked when you submit.{% else %}Everyone writes the same paper, 8 am – 8 pm. Ranked live.{% endif %}</small>
+            </span>
+            <span class="pn-boost-cta">{{ 'Go' if live_win.state == 'open' else 'Details' }} <i class="bi bi-arrow-right"></i></span>
+        </a>
+    </div>
+    <div class="col-md-12 col-xl-4">
+        <a href="{{ url_for('syllabus') }}" class="pn-boost pn-boost-syllabus anim-rise d2">
+            <span class="pn-boost-icon"><i class="bi bi-map"></i></span>
+            <span class="pn-boost-body">
+                <b>{% if coverage_n %}Syllabus covered: {{ cov_avg }}%{% else %}Syllabus coverage{% endif %}</b>
+                <small>{% if coverage_n %}Topics you have met across your {{ coverage_n }} subjects. Tap to find the gaps.{% else %}See every JAMB topic and which ones you have never been tested on.{% endif %}</small>
+            </span>
+            <span class="pn-boost-cta">Gaps <i class="bi bi-arrow-right"></i></span>
+        </a>
+    </div>
+</div>
+
+<!-- Daily challenge + fix mistakes + invite -->
+<div class="row g-3 mb-4">
+    <div class="col-md-6 col-xl-4">
+        <a href="{{ url_for('mistakes') }}" class="pn-boost pn-boost-fix anim-rise {{ 'done' if not mistakes.open else '' }}">
+            <span class="pn-boost-icon"><i class="bi bi-bandaid"></i></span>
+            <span class="pn-boost-body">
+                <b>{% if mistakes.open %}Fix my mistakes: {{ mistakes.open }} waiting{% else %}No mistakes to fix{% endif %}</b>
+                <small>{% if mistakes.open %}Questions you missed — clear them one by one.{% elif mistakes.fixed_total %}{{ mistakes.fixed_total }} fixed so far. Write a mock to find more.{% else %}Missed questions from mocks and practice collect here.{% endif %}</small>
+            </span>
+            <span class="pn-boost-cta">{{ 'Fix' if mistakes.open else 'Open' }} <i class="bi bi-arrow-right"></i></span>
+        </a>
+    </div>
+    <div class="col-md-6 col-xl-4">
+        <a href="{{ url_for('daily_challenge') }}" class="pn-boost pn-boost-challenge anim-rise d1 {{ 'done' if challenge_done else '' }}">
+            <span class="pn-boost-icon"><i class="bi bi-fire"></i></span>
+            <span class="pn-boost-body">
+                <b>{% if challenge_done %}Today's challenge done — {{ challenge_score }}/{{ challenge_size }} ✓{% else %}Daily Challenge: {{ challenge_size }} questions, 3 minutes{% endif %}</b>
+                <small>{% if challenge_done %}See the explanations or come back tomorrow for a new set.{% else %}Same questions for every student today. Keep your {{ streak_days }}-day streak alive 🔥{% endif %}</small>
+            </span>
+            <span class="pn-boost-cta">{{ 'Review' if challenge_done else 'Start' }} <i class="bi bi-arrow-right"></i></span>
+        </a>
+    </div>
+    <div class="col-md-12 col-xl-4">
+        <a href="{{ url_for('invite') }}" class="pn-boost pn-boost-invite anim-rise d2">
+            <span class="pn-boost-icon"><i class="bi bi-gift"></i></span>
+            <span class="pn-boost-body">
+                <b>Invite a friend, get {{ referral.reward_days }} free days</b>
+                <small>{% if referral.invited %}{{ referral.invited }} joined · {{ referral.days_earned }} days earned{% else %}Both of you get bonus days after their first mock.{% endif %}</small>
+            </span>
+            <span class="pn-boost-cta">Share <i class="bi bi-arrow-right"></i></span>
+        </a>
+    </div>
+</div>
+
+<!-- Stats -->
+<div class="row g-3 mb-4">
+    <div class="col-6 col-lg-3"><div class="pn-stat anim-rise"><span class="pn-stat-icon tint-green"><i class="bi bi-journal-check"></i></span><div><div class="pn-stat-value">{{ total_exams }}</div><div class="pn-stat-label">Exams taken</div></div></div></div>
+    <div class="col-6 col-lg-3"><div class="pn-stat anim-rise d1"><span class="pn-stat-icon tint-blue"><i class="bi bi-graph-up-arrow"></i></span><div><div class="pn-stat-value">{{ average }}%</div><div class="pn-stat-label">Average score</div></div></div></div>
+    <div class="col-6 col-lg-3"><div class="pn-stat anim-rise d2"><span class="pn-stat-icon tint-gold"><i class="bi bi-trophy"></i></span><div><div class="pn-stat-value">{{ best }}%</div><div class="pn-stat-label">Best score</div></div></div></div>
+    <div class="col-6 col-lg-3"><div class="pn-stat anim-rise d3"><span class="pn-stat-icon tint-purple"><i class="bi bi-bookmark-star"></i></span><div><div class="pn-stat-value">{{ bookmarks }}</div><div class="pn-stat-label">Bookmarks</div></div></div></div>
+</div>
+
+<!-- Quick actions -->
+<h2 class="h5 mb-3">What would you like to do?</h2>
+<div class="row g-3 mb-4">
+    {% set actions = [
+        (url_for('jamb_courses'), 'bi-mortarboard', 'tint-green', 'JAMB UTME mock', '4 subjects · 180 questions · 2 hours. Choose your course and we pick the right combination.'),
+        (url_for('waec_subjects'), 'bi-journal-text', 'tint-blue', 'WAEC / SSCE paper', 'All 16 WAEC subjects in the real WASSCE format — objective papers with the real count and clock, plus full corrections.'),
+        (url_for('neco_subjects'), 'bi-journal-bookmark', 'tint-purple', 'NECO / SSCE paper', 'All 16 NECO subjects in the real SSCE format — objective papers with the real count and clock, plus full corrections.'),
+        (url_for('post_utme'), 'bi-building', 'tint-gold', 'Post-UTME screening', 'Your university\'s real screening paper: its timing, subject mix and current affairs.'),
+        (url_for('practice'), 'bi-lightning-charge', 'tint-purple', 'Practice mode', 'Untimed drills with instant feedback and explanations after every question.'),
+        (url_for('my_bookmarks'), 'bi-bookmark-star', 'tint-red', 'My bookmarks', 'Revisit questions you saved for later and master them before exam day.'),
+        (url_for('leaderboard'), 'bi-trophy', 'tint-cyan', 'Leaderboard', 'See how you compare with other students across Nigeria this month.'),
+    ] %}
+    {% for href, icon, tint, title, text in actions %}
+    <div class="col-md-6 col-xl-4">
+        <div class="pn-action anim-rise d{{ loop.index0 % 4 }}">
+            <span class="pn-stat-icon {{ tint }}"><i class="bi {{ icon }}"></i></span>
+            <h3>{{ title }}</h3>
+            <p>{{ text }}</p>
+            <a href="{{ href }}" class="stretched-link fw-bold small">Open <i class="bi bi-arrow-right"></i></a>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+<div class="row g-3">
+    <!-- Recent results -->
+    <div class="col-lg-8">
+        <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center"><span><i class="bi bi-clock-history me-2 text-primary"></i>Recent exam activity</span><a href="{{ url_for('my_results') }}" class="small fw-bold">View all</a></div>
+            <div class="card-body p-0">
+                {% if recent %}
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0">
+                        <thead><tr><th>Exam</th><th class="d-none d-sm-table-cell">Score</th><th>Result</th><th class="d-none d-md-table-cell">Date</th><th></th></tr></thead>
+                        <tbody>
+                            {% for r in recent %}
+                            <tr>
+                                <td><div class="fw-bold">{{ r['exam_type'] }}</div><div class="small text-muted text-truncate" style="max-width:200px">{{ r['exam_name'] or '-' }}</div></td>
+                                <td class="d-none d-sm-table-cell">{{ r['score'] }}/{{ r['total'] }}</td>
+                                <td><span class="badge {{ 'bg-success' if r['percentage'] >= 70 else ('bg-warning text-dark' if r['percentage'] >= 50 else 'bg-danger') }}">{{ r['percentage'] }}%</span></td>
+                                <td class="d-none d-md-table-cell small text-muted">{{ r['date_taken']|nicedate('%d %b %Y, %I:%M %p') }}</td>
+                                <td class="text-end"><a href="{{ url_for('result_details', result_id=r['id']) }}" class="btn btn-sm btn-outline-primary">View</a></td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                <div class="pn-empty">
+                    <span class="ico"><i class="bi bi-clipboard-data"></i></span>
+                    <h3>No exams yet</h3>
+                    <p>Write your first mock to start building your performance history.</p>
+                    <a href="{{ url_for('exam_types') }}" class="btn btn-primary btn-sm">Start first exam</a>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Weak subjects -->
+    <div class="col-lg-4">
+        <div class="card h-100">
+            <div class="card-header"><i class="bi bi-bullseye me-2 text-danger"></i>Focus areas</div>
+            <div class="card-body">
+                {% if weak %}
+                    <p class="small text-muted">Your lowest-scoring subjects. Spend extra time here.</p>
+                    {% for w in weak %}
+                    <div class="mb-3">
+                        <div class="d-flex justify-content-between small mb-1"><span class="fw-semibold">{{ w['subject'] }}</span><span class="text-muted">{{ w['pct']|int }}%</span></div>
+                        <div class="progress"><div class="progress-bar {{ 'bg-danger' if w['pct'] < 50 else ('bg-warning' if w['pct'] < 70 else 'bg-success') }}" style="width:{{ w['pct']|int }}%"></div></div>
+                    </div>
+                    {% endfor %}
+                    <a href="{{ url_for('practice') }}" class="btn btn-outline-primary btn-sm w-100 mt-2"><i class="bi bi-lightning-charge me-1"></i> Practise these subjects</a>
+                {% else %}
+                    <div class="pn-empty py-4">
+                        <span class="ico"><i class="bi bi-bullseye"></i></span>
+                        <h3>Nothing to show yet</h3>
+                        <p class="mb-0">After a few exams we will highlight the subjects that need the most work.</p>
+                    </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

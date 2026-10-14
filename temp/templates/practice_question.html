@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}Practice — {{ subject }}{% endblock %}
+
+{% block content %}
+{% set answered = feedback is not none %}
+<div class="pn-page-head anim-rise mb-3">
+    <div>
+        <div class="pn-breadcrumb"><a href="{{ url_for('practice') }}">Practice</a><i class="bi bi-chevron-right"></i><span>{{ exam_type }} · {{ subject }}</span></div>
+        <h1 class="h3">{{ subject }} <span class="badge bg-primary align-middle ms-1">{{ exam_type }}</span></h1>
+        {% if topic %}<div class="small mt-1"><span class="badge text-bg-warning"><i class="bi bi-bullseye me-1"></i>Topic drill: {{ topic }}</span> <a class="ms-1" href="{{ url_for('practice_question', exam_type=exam_type, subject=subject) }}">Practise the whole subject instead</a></div>{% endif %}
+    </div>
+    <div class="d-flex align-items-center gap-2">
+        <div class="pn-kpi py-2 px-3"><b class="fs-6 text-primary">{{ state.correct }}/{{ state.total }}</b><small>correct</small></div>
+        {% if remaining is not none %}<div class="pn-kpi py-2 px-3"><b class="fs-6">{{ remaining }}</b><small>free left</small></div>{% endif %}
+        <form method="POST" action="{{ url_for('practice_reset', exam_type=exam_type, subject=subject, topic=topic or None) }}"><input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token() }}"><button class="btn btn-sm btn-outline-secondary" title="Reset score"><i class="bi bi-arrow-counterclockwise"></i></button></form>
+    </div>
+</div>
+
+<div class="row g-3">
+    <div class="col-lg-8">
+        <div class="pn-qcard">
+            <div class="pn-qhead">
+                <div class="pn-qnum">Question <strong>{{ state.total + (0 if answered else 1) }}</strong>{% if q.topic %} <span class="text-muted fw-semibold ms-2">· {{ q.topic }}</span>{% endif %}{% if q.difficulty %} <span class="badge {{ 'bg-success' if q.difficulty == 'Easy' else ('bg-warning text-dark' if q.difficulty == 'Medium' else 'bg-danger') }} ms-1">{{ q.difficulty }}</span>{% endif %}</div>
+                <form method="POST" action="{{ url_for('bookmark_question') }}" class="d-flex flex-nowrap align-items-start">
+                    <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token() }}">
+                    <input type="hidden" name="question_id" value="{{ q.id }}">
+                    <input type="hidden" name="source" value="{{ q.source if q.source else 'questions_v2' }}">
+                    <input type="hidden" name="exam_type" value="{{ exam_type }}">
+                    <input type="hidden" name="subject" value="{{ subject }}">
+                    <button class="btn btn-sm text-nowrap {{ 'btn-warning' if bookmarked else 'btn-outline-warning' }}" type="submit" title="{{ 'Remove bookmark' if bookmarked else 'Bookmark this question' }}"><i class="bi {{ 'bi-bookmark-star-fill' if bookmarked else 'bi-bookmark-star' }}"></i><span class="d-none d-sm-inline"> {{ 'Bookmarked' if bookmarked else 'Bookmark' }}</span></button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary ms-1 pn-report-link" data-report='{{ {"question_id": q.id, "source": q.source or "questions_v2", "subject": subject, "exam_type": exam_type}|tojson }}' title="Report a problem with this question"><i class="bi bi-flag"></i> <span class="d-none d-sm-inline">Report</span></button>
+                </form>
+            </div>
+            {% if q.passage %}{{ q.passage|passage_html }}{% endif %}
+            <div class="pn-qtext{% if q.orals %} pn-qtext-orals{% endif %}">{% if q.orals %}<button class="pn-say pn-say-stem" type="button" data-say="{{ q.text|say }}"><i class="bi bi-volume-up-fill"></i> Hear this question</button>{% endif %}{{ q.text }}</div>
+
+            {% if not answered %}
+            <form method="POST" action="{{ url_for('practice_question', exam_type=exam_type, subject=subject, topic=topic or None) }}" id="practiceForm" data-once>
+                <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token() }}">
+                <input type="hidden" name="question_id" value="{{ q.id }}">
+                {% if topic %}<input type="hidden" name="topic" value="{{ topic }}">{% endif %}
+                {% for k, v in q.options.items() %}
+                <label class="pn-option" data-key="{{ k }}">
+                    <input type="radio" name="answer" value="{{ k }}" required>
+                    <span class="key">{{ k }}</span><span class="txt">{{ v }}</span>{% if q.orals %}<button class="pn-say pn-say-opt" type="button" data-say="{{ v }}" aria-label="Listen to option {{ k }}"><i class="bi bi-volume-up-fill"></i></button>{% endif %}
+                </label>
+                {% endfor %}
+                <div class="pn-qactions">
+                    <div class="left"><a href="{{ url_for('practice_question', exam_type=exam_type, subject=subject, topic=topic or None) }}" class="btn btn-outline-secondary"><i class="bi bi-skip-forward"></i> Skip</a></div>
+                    <div class="right"><button class="btn btn-primary" type="submit" id="checkBtn" disabled data-loading="Checking…">Check answer <i class="bi bi-check2-circle"></i></button></div>
+                </div>
+            </form>
+            {% else %}
+                {% for k, v in q.options.items() %}
+                <div class="pn-option locked {% if k == feedback.q.correct %}correct{% elif k == feedback.chosen %}wrong{% endif %}">
+                    <span class="key">{{ k }}</span><span class="txt">{{ v }}</span>{% if q.orals %}<button class="pn-say pn-say-opt" type="button" data-say="{{ v }}" aria-label="Listen to option {{ k }}"><i class="bi bi-volume-up-fill"></i></button>{% endif %}
+                    {% if k == feedback.q.correct %}<i class="bi bi-check-circle-fill text-success ms-auto fs-5"></i>{% elif k == feedback.chosen %}<i class="bi bi-x-circle-fill text-danger ms-auto fs-5"></i>{% endif %}
+                </div>
+                {% endfor %}
+                <div class="pn-explain {{ '' if feedback.is_correct else 'wrong' }}">
+                    <div class="d-flex align-items-center gap-2 mb-2">
+                        {% if feedback.is_correct %}<i class="bi bi-emoji-smile-fill text-success fs-4"></i><b class="text-success">Correct! Well done.</b>{% else %}<i class="bi bi-emoji-neutral-fill text-warning fs-4"></i><b class="text-danger">Not quite.</b> <span>The correct answer is <b>{{ feedback.q.correct }}</b>.</span>{% endif %}
+                    </div>
+                    <h5>Explanation</h5>
+                    <div style="white-space:pre-line">{{ feedback.q.explanation }}</div>
+                </div>
+                <div class="pn-qactions">
+                    <div class="left"><a href="{{ url_for('practice') }}" class="btn btn-outline-secondary"><i class="bi bi-grid"></i> Subjects</a></div>
+                    <div class="right"><a href="{{ url_for('practice_question', exam_type=exam_type, subject=subject, topic=topic or None) }}" class="btn btn-primary" id="nextQ">Next question <i class="bi bi-arrow-right"></i></a></div>
+                </div>
+            {% endif %}
+        </div>
+    </div>
+    <div class="col-lg-4">
+        <div class="card">
+            <div class="card-body">
+                <h3 class="h6 text-uppercase text-muted ls-1 mb-3">This session</h3>
+                {% set pct = (100 * state.correct / state.total)|round|int if state.total else 0 %}
+                <div class="pn-score-ring mb-3" style="--p:{{ pct }};--c:{{ 'var(--pn-success)' if pct >= 70 else ('var(--pn-warning)' if pct >= 50 else 'var(--pn-danger)') }};width:130px;height:130px"><div><b style="font-size:1.6rem">{{ pct }}%</b><small>accuracy</small></div></div>
+                <div class="row g-2 text-center">
+                    <div class="col-4"><div class="pn-kpi"><b class="text-success">{{ state.correct }}</b><small>Right</small></div></div>
+                    <div class="col-4"><div class="pn-kpi"><b class="text-danger">{{ state.total - state.correct }}</b><small>Wrong</small></div></div>
+                    <div class="col-4"><div class="pn-kpi"><b>{{ state.total }}</b><small>Total</small></div></div>
+                </div>
+                <hr>
+                <p class="small text-muted mb-2"><i class="bi bi-lightbulb me-1 text-warning"></i>Tip: read the explanation even when you are right — it often reveals a faster method.</p>
+                <a href="{{ url_for('exam_types') }}" class="btn btn-outline-primary btn-sm w-100"><i class="bi bi-stopwatch me-1"></i> Ready for a timed mock?</a>
+            </div>
+        </div>
+    </div>
+</div>
+{% include "_report_modal.html" %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    var form = document.getElementById('practiceForm'); if (!form) { var n = document.getElementById('nextQ'); document.addEventListener('keydown', function(e){ if (e.key === 'Enter' || e.key === 'ArrowRight') { n.click(); } }); return; }
+    var opts = form.querySelectorAll('.pn-option'), btn = document.getElementById('checkBtn');
+    function pick(o){ opts.forEach(function(x){ x.classList.remove('selected'); }); o.classList.add('selected'); o.querySelector('input').checked = true; btn.disabled = false; }
+    opts.forEach(function(o){ o.addEventListener('click', function(e){ if (e.target.closest && e.target.closest('.pn-say')) return; pick(o); }); });
+    document.addEventListener('keydown', function(e){
+        var k = e.key.toUpperCase();
+        if (['A','B','C','D'].indexOf(k) > -1) { var o = form.querySelector('.pn-option[data-key="'+k+'"]'); if (o) pick(o); }
+        else if (e.key === 'Enter' && !btn.disabled) { form.requestSubmit(); }
+    });
+})();
+</script>
+{% endblock %}

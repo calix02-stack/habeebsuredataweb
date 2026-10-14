@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Admin Panel</title>
+
+    <!-- Bootstrap -->
+    <link href="/static/vendor/bootstrap/bootstrap.min.css" rel="stylesheet">
+
+    <!-- Google Font -->
+
+    <style>
+
+        body{
+            background: linear-gradient(135deg, #eef4ff, #f9fbff);
+            font-family: 'Poppins', sans-serif;
+            min-height: 100vh;
+        }
+
+        .admin-container{
+            max-width: 950px;
+            margin: auto;
+            margin-top: 50px;
+            margin-bottom: 50px;
+        }
+
+        .admin-card{
+            background: white;
+            padding: 45px;
+            border-radius: 25px;
+            box-shadow: 0px 15px 40px rgba(0,0,0,0.08);
+            animation: fadeIn 0.8s ease;
+        }
+
+        .title{
+            font-size: 34px;
+            font-weight: 700;
+            margin-bottom: 10px;
+            color: #111827;
+        }
+
+        .subtitle{
+            color: #6c757d;
+            margin-bottom: 35px;
+        }
+
+        label{
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+
+        .form-control{
+            border-radius: 12px;
+            padding: 14px;
+            border: 1px solid #dbe3f0;
+            box-shadow: none;
+        }
+
+        .form-control:focus{
+            border-color: #0d6efd;
+            box-shadow: 0px 0px 0px 4px rgba(13,110,253,0.12);
+        }
+
+        textarea{
+            resize: none;
+        }
+
+        .btn-submit{
+            width: 100%;
+            padding: 16px;
+            font-size: 18px;
+            font-weight: 600;
+            border-radius: 14px;
+            transition: 0.3s;
+        }
+
+        .btn-submit:hover{
+            transform: translateY(-2px);
+        }
+
+        .section-title{
+            font-size: 20px;
+            font-weight: 600;
+            margin-top: 25px;
+            margin-bottom: 20px;
+            color: #0d6efd;
+        }
+
+        @keyframes fadeIn{
+            from{
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to{
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @media(max-width:768px){
+
+            .admin-card{
+                padding: 30px 20px;
+            }
+
+            .title{
+                font-size: 28px;
+            }
+
+        }
+
+    </style>
+</head>
+<body>
+
+<div class="container admin-container">
+
+    <div class="admin-card">
+
+        <h2 class="title">
+            CBT Question Management
+        </h2>
+
+        <p class="subtitle">
+                Add professional JAMB & WAEC CBT questions for students practice.
+        </p>
+
+        <!-- Admin Actions -->
+                <div class="mb-4 text-center">
+
+                    <a href="/import_questions_v2"
+                    class="btn btn-success me-2">
+
+                        📤 Bulk Upload Questions
+
+                    </a>
+
+                    <a href="/download_question_template"
+                    class="btn btn-outline-primary me-2">
+
+                        📥 Download Excel Template
+
+                    </a>
+
+                    <a href="/manage_questions"
+                    class="btn btn-dark me-2">
+
+                        📋 Manage Questions
+
+                    </a>
+
+                    <a href="/export_questions"
+                    class="btn btn-info">
+
+                        📥 Export Questions
+
+                    </a>
+
+                </div>
+
+                <hr>
+
+            <div class="section-title">
+                🎓 POST-UTME Management
+            </div>
+
+            <div class="text-center mb-4">
+
+                <a href="/add_post_utme_question"
+                class="btn btn-warning me-2">
+
+                    ➕ Add POST-UTME Question
+
+                </a>
+
+                <a href="/manage_post_utme_universities"
+                class="btn btn-primary me-2">
+
+                    🏫 Manage Universities
+
+                </a>
+
+                <a href="/manage_post_utme_courses"
+                class="btn btn-success me-2">
+
+                    📚 Manage Courses
+
+                </a>
+
+                <a href="/manage_subject_combinations"
+                class="btn btn-info">
+
+                    📖 Manage Subject Combinations
+
+                </a>
+
+                <a href="/manage_students"
+                    class="btn btn-dark">
+
+                    👨‍🎓 Manage Students
+
+                </a>
+
+                <a href="/centres"
+                   class="btn btn-dark">
+
+                    🏫 Schools &amp; Centres
+
+                </a>
+
+                <a href="/manage_subscriptions"
+                    class="btn btn-success">
+
+                    💳 Subscriptions &amp; Payments
+
+                </a>
+
+                <a href="/manage_subjects"
+                    class="btn btn-primary me-2">
+
+                    📚 Manage Subjects
+
+                </a>
+
+                <a href="/manage_topics"
+                    class="btn btn-info me-2">
+
+                    📖 Manage Topics
+
+                </a>
+
+            </div>
+
+            <hr>
+
+            <form method="POST">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+            <!-- Exam Type -->
+            <div class="mb-4">
+
+                <label>
+                    Exam Type
+                </label>
+
+                <select name="exam_type"
+                        class="form-control"
+                        required>
+
+                    <option value="">Select Exam Type</option>
+
+                    <option value="JAMB">
+                        JAMB
+                    </option>
+
+                    <option value="WAEC">
+                        WAEC
+                    </option>
+
+                </select>
+
+            </div>
+
+            <!-- Subject -->
+            <div class="mb-4">
+
+                <label>
+                    Subject
+                </label>
+
+                <select name="subject"
+                        class="form-control"
+                        required>
+
+                    <option value="">
+                        Select Subject
+                    </option>
+
+                    <option value="English">
+                        English
+                    </option>
+
+                    <option value="Mathematics">
+                        Mathematics
+                    </option>
+
+                    <option value="Physics">
+                        Physics
+                    </option>
+
+                    <option value="Chemistry">
+                        Chemistry
+                    </option>
+
+                    <option value="Biology">
+                        Biology
+                    </option>
+
+                    <option value="Economics">
+                        Economics
+                    </option>
+
+                    <option value="Government">
+                        Government
+                    </option>
+
+                    <option value="Literature">
+                        Literature
+                    </option>
+
+                    <option value="CRS">
+                        CRS
+                    </option>
+
+                    <option value="IRS">
+                        IRS
+                    </option>
+
+                    <option value="Commerce">
+                        Commerce
+                    </option>
+
+                    <option value="Accounting">
+                        Accounting
+                    </option>
+
+                    <option value="Geography">
+                        Geography
+                    </option>
+
+                    <option value="Agricultural Science">
+                        Agricultural Science
+                    </option>
+
+                    <option value="Civic Education">
+                        Civic Education
+                    </option>
+
+                    <option value="Further Mathematics">
+                        Further Mathematics
+                    </option>
+
+                    <option value="Computer Studies">
+                        Computer Studies
+                    </option>
+
+                </select>
+
+            </div>
+
+            <!-- Question -->
+            <div class="mb-4">
+
+                <label>
+                    Question
+                </label>
+
+                <textarea name="question"
+                          class="form-control"
+                          rows="4"
+                          placeholder="Enter CBT question here..."
+                          required></textarea>
+
+            </div>
+
+            <!-- Options -->
+            <div class="section-title">
+                Answer Options
+            </div>
+
+            <div class="mb-3">
+
+                <label>
+                    Option A
+                </label>
+
+                <input type="text"
+                       name="option_a"
+                       class="form-control"
+                       required>
+
+            </div>
+
+            <div class="mb-3">
+
+                <label>
+                    Option B
+                </label>
+
+                <input type="text"
+                       name="option_b"
+                       class="form-control"
+                       required>
+
+            </div>
+
+            <div class="mb-3">
+
+                <label>
+                    Option C
+                </label>
+
+                <input type="text"
+                       name="option_c"
+                       class="form-control"
+                       required>
+
+            </div>
+
+            <div class="mb-4">
+
+                <label>
+                    Option D
+                </label>
+
+                <input type="text"
+                       name="option_d"
+                       class="form-control"
+                       required>
+
+            </div>
+
+            <!-- Correct Answer -->
+            <div class="mb-4">
+
+                <label>
+                    Correct Answer
+                </label>
+
+                <select name="correct_answer"
+                        class="form-control"
+                        required>
+
+                    <option value="">
+                        Select Correct Answer
+                    </option>
+
+                    <option value="A">
+                        Option A
+                    </option>
+
+                    <option value="B">
+                        Option B
+                    </option>
+
+                    <option value="C">
+                        Option C
+                    </option>
+
+                    <option value="D">
+                        Option D
+                    </option>
+
+                </select>
+
+            </div>
+
+            <!-- Explanation -->
+            <div class="mb-4">
+
+                <label>
+                    Solution Explanation
+                </label>
+
+                <textarea name="explanation"
+                          class="form-control"
+                          rows="5"
+                          placeholder="Explain why the answer is correct..."
+                          required></textarea>
+
+            </div>
+
+            <!-- Submit -->
+            <button type="submit"
+                    class="btn btn-primary btn-submit">
+
+                ➕ Add Question to Database
+
+            </button>
+        </form>
+
+    </div>
+
+</div>
+
+</body>
+</html>

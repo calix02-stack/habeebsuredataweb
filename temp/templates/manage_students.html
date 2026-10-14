@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+<head>
+
+<title>Manage Students</title>
+
+<link href="/static/vendor/bootstrap/bootstrap.min.css"
+      rel="stylesheet">
+
+</head>
+<body>
+
+<div class="container mt-5">
+
+    <h2>
+        👨‍🎓 Student Management
+    </h2>
+
+    <a href="/admin"
+       class="btn btn-secondary mb-3">
+
+        ← Back
+
+    </a>
+
+    <form method="GET" class="mb-3">
+
+        <input type="text"
+               name="search"
+               class="form-control"
+               placeholder="Search student..."
+               value="{{ search }}">
+
+    </form>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for category, message in messages %}
+            <div class="alert alert-{{ 'success' if category == 'success' else 'danger' }}" style="font-size:1.05rem">
+                {{ message }}
+            </div>
+        {% endfor %}
+    {% endwith %}
+
+    <table class="table table-bordered table-striped">
+
+        <thead class="table-dark">
+
+            <tr>
+
+                <th>ID</th>
+                <th>Name</th>
+                <th>Email</th>
+                <th>Status</th>
+                <th>Date Joined</th>
+                <th>Action</th>
+
+            </tr>
+
+        </thead>
+
+        <tbody>
+
+            {% for s in students %}
+
+            <tr>
+
+                <td>{{ s[0] }}</td>
+                <td>{{ s[3] }}</td>
+                <td>{{ s[1] }}</td>
+                <td>{{ s[5] }}</td>
+                <td>{{ s[6] }}</td>
+
+                <td>
+
+                    <a href="/view_student/{{ s[0] }}"
+                       class="btn btn-primary btn-sm">
+
+                        👁 View
+
+                    </a>
+
+                    <form method="POST"
+                          action="/reset_student_password/{{ s[0] }}"
+                          class="d-inline"
+                          onsubmit="return confirm('Generate a new temporary password for this student?');">
+
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+                        <button type="submit"
+                                class="btn btn-warning btn-sm">
+
+                            🔑 Reset password
+
+                        </button>
+
+                    </form>
+
+                </td>
+
+            </tr>
+
+            {% endfor %}
+
+        </tbody>
+
+    </table>
+
+</div>
+
+</body>
+</html>

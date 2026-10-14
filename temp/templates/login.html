@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block flashes %}{% endblock %}
+{% block title %}Student Login{% endblock %}
+{% block navbar %}{% endblock %}
+{% block footer %}{% endblock %}
+
+{% block main %}
+<div class="pn-auth">
+    {% include "_auth_side.html" %}
+    <div class="pn-auth-body">
+        <div class="pn-auth-card">
+            <a class="pn-brand d-lg-none mb-4" href="/"><span class="pn-logo">PN</span><span>PrepNova <span class="text-primary">CBT</span></span></a>
+            <h1>Welcome back</h1>
+            <p class="sub">Log in to continue your CBT preparation.</p>
+
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ 'danger' if category == 'danger' else ('success' if category == 'success' else 'warning') }} d-flex gap-2 align-items-start">
+                        <i class="bi {{ 'bi-x-circle-fill' if category == 'danger' else ('bi-check-circle-fill' if category == 'success' else 'bi-exclamation-triangle-fill') }} mt-1"></i><span>{{ message }}</span>
+                    </div>
+                {% endfor %}
+            {% endwith %}
+
+            <form method="POST" action="{{ url_for('login') }}" data-once novalidate>
+                <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token() }}">
+                <div class="mb-3">
+                    <label class="form-label" for="email">Email address</label>
+                    <div class="input-group">
+                        <span class="input-group-text"><i class="bi bi-envelope"></i></span>
+                        <input type="email" class="form-control" id="email" name="email" value="{{ email }}" placeholder="you@example.com" autocomplete="email" inputmode="email" required autofocus>
+                    </div>
+                </div>
+                <div class="mb-2">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <label class="form-label mb-1" for="password">Password</label>
+                        <a href="{{ url_for('forgot_password') }}" class="small fw-semibold">Forgot password?</a>
+                    </div>
+                    <div class="pn-password-wrap">
+                        <input type="password" class="form-control" id="password" name="password" placeholder="Your password" autocomplete="current-password" required>
+                        <button type="button" class="pn-eye" data-toggle-password="password" aria-label="Show password"><i class="bi bi-eye"></i></button>
+                    </div>
+                </div>
+                <button type="submit" class="btn btn-primary btn-lg w-100 mt-3" data-loading="Signing in…">Log in <i class="bi bi-arrow-right ms-1"></i></button>
+            </form>
+
+            <p class="text-center small text-muted mt-4 mb-0">New to PrepNova? <a href="{{ url_for('register') }}" class="fw-bold">Create a free account</a></p>
+            <p class="text-center small text-muted mt-3 mb-0"><i class="bi bi-shield-lock me-1"></i>For your security, an account can only be signed in on one device at a time.</p>
+        </div>
+    </div>
+</div>
+{% endblock %}
