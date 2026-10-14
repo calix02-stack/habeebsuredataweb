@@ -1,0 +1,6030 @@
+"""
+PrepNova CBT — administration routes (Blueprint).
+
+Extracted from the original monolithic app.py. All routes are protected by the
+`admin_required` decorator that is applied automatically in `before_request`,
+and every state-changing request is CSRF-checked by the application.
+"""
+
+import io
+import json
+import os
+import secrets
+import time
+from datetime import datetime, timedelta
+from io import BytesIO
+
+import qrcode
+from flask import (Blueprint, abort, flash, redirect, render_template, request, send_file, session, url_for)
+from openpyxl import load_workbook
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+from db import connect, DB_PATH
+from helpers import activate_subscription as grant_plan
+from helpers import generate_access_codes, pretty_code, fmt_naira, ensure_referral_code, email_wrap, app_url, send_email
+from centre import (DURATIONS, DURATION_LABEL, activate_centre_order, extend_centre,
+                    order_total, _centre_stats)
+from security import password_problems
+from werkzeug.security import generate_password_hash
+from security import admin_required
+import sqlite3
+
+admin_bp = Blueprint("admin_bp", __name__)
+
+
+@admin_bp.before_request
+def _guard():
+    if not session.get("admin"):
+        flash("Administrator login required.", "warning")
+        return redirect(url_for("admin_login"))
+
+
+@admin_bp.after_request
+def _admin_chrome(response):
+    """Inject the shared PrepNova admin bar + flash messages into every legacy admin page.
+
+    The legacy admin templates are standalone HTML documents; instead of editing each of
+    them we splice the rendered partial right after <body> and make sure Bootstrap's JS
+    bundle is available for dismissible alerts.
+    """
+    ctype = response.headers.get("Content-Type", "")
+    if response.status_code != 200 or not ctype.startswith("text/html") or response.direct_passthrough:
+        return response
+    try:
+        body = response.get_data(as_text=True)
+    except Exception:
+        return response
+    if "pn-admin-bar" in body:
+        return response
+    import re as _re
+
+    m = _re.search(r"<body[^>]*>", body, flags=_re.I)
+    if not m:
+        return response
+    bar = render_template("_admin_bar.html")
+    body = body[:m.end()] + bar + body[m.end():]
+    if "bootstrap.bundle.min.js" not in body:
+        body = body.replace("</body>", '<script src="/static/vendor/bootstrap/bootstrap.bundle.min.js"></script></body>', 1)
+    response.set_data(body)
+    return response
+
+
+def _paystack_ready():
+    from flask import current_app
+    return bool(current_app.config.get("PAYSTACK_READY"))
+
+
+def _audit(action, target=None):
+    try:
+        conn = connect()
+        conn.execute(
+            "INSERT INTO admin_audit_log (admin_email, action, target, ip_address) VALUES (?, ?, ?, ?)",
+            (session.get("admin"), action, str(target)[:200] if target is not None else None, request.remote_addr),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+@admin_bp.route("/manage_post_utme_universities")
+def manage_post_utme_universities():
+    """Post-UTME formats: one row per university with its timing and paper make-up (post_utme.py)."""
+    import post_utme as putme
+    conn = connect()
+    rows = conn.execute(
+        "SELECT * FROM post_utme_universities ORDER BY COALESCE(status, 'Active') != 'Active', university_name LIKE 'Any other%', university_name"
+    ).fetchall()
+    uploads = {r["university_name"]: r["n"] for r in conn.execute(
+        "SELECT university_name, COUNT(*) AS n FROM post_utme_questions GROUP BY university_name").fetchall()}
+    ca = conn.execute(
+        """SELECT COUNT(*) FROM questions_v2 q JOIN subjects s ON s.id = q.subject_id JOIN exam_types e ON e.id = s.exam_type_id
+           WHERE e.exam_name = 'POST-UTME' AND s.subject_name = 'Current Affairs' AND q.status = 'Active'"""
+    ).fetchone()[0]
+    conn.close()
+    unis = []
+    for u in rows:
+        sections = putme.parse_sections(u["sections_json"], u["total_questions"])
+        unis.append({"id": u["id"], "name": u["university_name"], "duration": u["duration"], "total": putme.sections_total(sections),
+                     "status": u["status"] or "Active", "chips": putme.describe(sections), "note": u["note"] or "",
+                     "uploads": uploads.get(u["university_name"], 0)})
+    return render_template("manage_post_utme_universities.html", universities=unis, ca_count=ca)
+
+
+def _sections_from_form(form):
+    """Rows of (kind, count) from the edit form -> JSON list; returns (json, total, error)."""
+    import post_utme as putme
+    kinds = form.getlist("sec_kind")
+    counts = form.getlist("sec_count")
+    out = []
+    for kind, n in zip(kinds, counts):
+        kind = (kind or "").strip()
+        if not kind:
+            continue
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            return None, 0, "Every section needs a whole number of questions."
+        if n <= 0:
+            continue
+        if kind not in ("ALL", "CA") and kind not in putme.PICK_KINDS and kind not in putme.JAMB_ELECTIVES and kind != putme.ENGLISH:
+            return None, 0, f"Unknown section type: {kind}"
+        out.append([kind, n])
+    if not out:
+        return None, 0, "Add at least one section."
+    return json.dumps(out), putme.sections_total(out), None
+
+
+@admin_bp.route("/edit_post_utme_university/<int:university_id>", methods=["GET", "POST"])
+@admin_bp.route("/add_post_utme_university", methods=["GET", "POST"], defaults={"university_id": None})
+def edit_post_utme_university(university_id):
+    import post_utme as putme
+    conn = connect()
+    uni = conn.execute("SELECT * FROM post_utme_universities WHERE id = ?", (university_id,)).fetchone() if university_id else None
+    if university_id and not uni:
+        conn.close()
+        abort(404)
+    if request.method == "POST":
+        name = (request.form.get("university_name") or "").strip()[:120]
+        note = (request.form.get("note") or "").strip()[:200]
+        status = "Active" if request.form.get("status") == "Active" else "Hidden"
+        try:
+            duration = int(request.form.get("duration") or 0)
+        except ValueError:
+            duration = 0
+        sections_json, total, err = _sections_from_form(request.form)
+        if not name or not 5 <= duration <= 240:
+            err = err or "Enter the university name and a duration between 5 and 240 minutes."
+        if err:
+            conn.close()
+            flash(err, "danger")
+            return redirect(request.url)
+        clash = conn.execute("SELECT id FROM post_utme_universities WHERE university_name = ? AND id != ?", (name, university_id or 0)).fetchone()
+        if clash:
+            conn.close()
+            flash("Another university already has that name.", "danger")
+            return redirect(request.url)
+        if uni:
+            conn.execute(
+                "UPDATE post_utme_universities SET university_name = ?, exam_mode = 'CBT', duration = ?, total_questions = ?, sections_json = ?, note = ?, status = ? WHERE id = ?",
+                (name, duration, total, sections_json, note, status, university_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO post_utme_universities (university_name, exam_mode, duration, total_questions, pass_mark, sections_json, note, status) VALUES (?, 'CBT', ?, ?, 50, ?, ?, ?)",
+                (name, duration, total, sections_json, note, status),
+            )
+        conn.commit()
+        conn.close()
+        flash(f"Saved {name}: {total} questions in {duration} minutes.", "success")
+        return redirect(url_for("admin_bp.manage_post_utme_universities"))
+    sections = putme.parse_sections(uni["sections_json"], uni["total_questions"]) if uni else [("ALL", 40), ("CA", 10)]
+    conn.close()
+    kinds = [("ALL", "Student's 4 UTME subjects (shared evenly)"), ("PICK2", "2 subjects the student ticks"), ("CA", "Current affairs / general knowledge"),
+             (putme.ENGLISH, putme.ENGLISH)] + [(s, s) for s in putme.JAMB_ELECTIVES]
+    return render_template("edit_post_utme_university.html", university=uni, sections=sections, kinds=kinds)
+
+
+@admin_bp.route("/manage_post_utme_courses")
+def manage_post_utme_courses():
+    search = request.args.get(
+        "search",
+        ""
+    ).strip()
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    if search:
+
+        cursor.execute(
+            """
+            SELECT *
+            FROM post_utme_courses
+            WHERE
+                university_name LIKE ?
+                OR course_name LIKE ?
+            ORDER BY university_name
+            """,
+            (
+                f"%{search}%",
+                f"%{search}%"
+            )
+        )
+
+    else:
+
+        cursor.execute(
+            """
+            SELECT *
+            FROM post_utme_courses
+            ORDER BY university_name
+            """
+        )
+
+    courses = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "manage_post_utme_courses.html",
+        courses=courses,
+        search=search
+    )
+
+
+@admin_bp.route(
+    "/edit_post_utme_course/<int:course_id>",
+    methods=["GET", "POST"]
+)
+def edit_post_utme_course(course_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    if request.method == "POST":
+
+        university_name = request.form["university_name"]
+        course_name = request.form["course_name"]
+
+        cursor.execute(
+            """
+            UPDATE post_utme_courses
+            SET
+                university_name=?,
+                course_name=?
+            WHERE id=?
+            """,
+            (
+                university_name,
+                course_name,
+                course_id
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+        return redirect(
+            "/manage_post_utme_courses"
+        )
+
+    # Current course
+    cursor.execute(
+        """
+        SELECT *
+        FROM post_utme_courses
+        WHERE id=?
+        """,
+        (course_id,)
+    )
+
+    course = cursor.fetchone()
+
+    # Universities dropdown
+    cursor.execute(
+        """
+        SELECT university_name
+        FROM post_utme_universities
+        ORDER BY university_name
+        """
+    )
+
+    universities = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "edit_post_utme_course.html",
+        course=course,
+        universities=universities
+    )
+
+
+@admin_bp.route(
+    "/add_post_utme_course",
+    methods=["GET", "POST"]
+)
+def add_post_utme_course():
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    if request.method == "POST":
+
+        university_name = request.form[
+            "university_name"
+        ]
+
+        course_name = request.form[
+            "course_name"
+        ]
+
+        # Prevent duplicate course
+        cursor.execute(
+            """
+            SELECT id
+            FROM post_utme_courses
+            WHERE
+                university_name=?
+                AND course_name=?
+            """,
+            (
+                university_name,
+                course_name
+            )
+        )
+
+        existing = cursor.fetchone()
+
+        if existing:
+
+            conn.close()
+
+            return """
+            Course already exists.
+            """
+
+        cursor.execute(
+            """
+            INSERT INTO post_utme_courses
+            (
+                university_name,
+                course_name
+            )
+            VALUES (?, ?)
+            """,
+            (
+                university_name,
+                course_name
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+        return redirect(
+            "/manage_post_utme_courses"
+        )
+
+    cursor.execute(
+        """
+        SELECT university_name
+        FROM post_utme_universities
+        ORDER BY university_name
+        """
+    )
+
+    universities = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "add_post_utme_course.html",
+        universities=universities
+    )
+
+
+@admin_bp.route("/manage_subjects")
+def manage_subjects():
+    search = request.args.get("search", "").strip()
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    sql = """
+        SELECT *
+        FROM subjects
+    """
+
+    params = []
+
+    if search:
+
+        sql += """
+            WHERE subject_name LIKE ?
+            OR exam_type LIKE ?
+            OR subject_code LIKE ?
+        """
+
+        keyword = f"%{search}%"
+
+        params = [
+            keyword,
+            keyword,
+            keyword
+        ]
+
+    sql += """
+        ORDER BY exam_type,
+                 subject_name
+    """
+
+    cursor.execute(sql, params)
+
+    subjects = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "manage_subjects.html",
+        subjects=subjects,
+        search=search
+    )
+
+
+@admin_bp.route("/add_subject", methods=["GET", "POST"])
+def add_subject():
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    if request.method == "POST":
+
+        exam_type = request.form["exam_type"].strip()
+        subject_name = request.form["subject_name"].strip()
+        subject_code = request.form["subject_code"].strip().upper()
+        status = request.form["status"].strip()
+
+        # Validation
+        if not exam_type or not subject_name:
+            conn.close()
+            return "Exam Type and Subject Name are required."
+
+        # Prevent duplicate subjects
+        cursor.execute("""
+            SELECT id
+            FROM subjects
+            WHERE exam_type=?
+            AND subject_name=?
+        """, (exam_type, subject_name))
+
+        existing = cursor.fetchone()
+
+        if existing:
+
+            conn.close()
+
+            flash(
+                "Subject already exists.",
+                "warning"
+            )
+
+            return redirect("/manage_subjects")
+
+        cursor.execute("""
+            INSERT INTO subjects
+            (
+                exam_type,
+                subject_name,
+                subject_code,
+                status
+            )
+            VALUES (?, ?, ?, ?)
+        """, (
+            exam_type,
+            subject_name,
+            subject_code,
+            status
+        ))
+
+        conn.commit()
+        conn.close()
+
+        flash(
+            "Subject added successfully.",
+            "success"
+        )
+
+        return redirect("/manage_subjects")
+
+    conn.close()
+
+    return render_template("add_subject.html")
+
+
+@admin_bp.route("/edit_subject/<int:subject_id>", methods=["GET", "POST"])
+def edit_subject(subject_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    if request.method == "POST":
+
+        exam_type = request.form["exam_type"].strip()
+        subject_name = request.form["subject_name"].strip()
+        subject_code = request.form["subject_code"].strip().upper()
+        status = request.form["status"].strip()
+
+        cursor.execute("""
+            UPDATE subjects
+            SET
+                exam_type=?,
+                subject_name=?,
+                subject_code=?,
+                status=?
+            WHERE id=?
+        """, (
+            exam_type,
+            subject_name,
+            subject_code,
+            status,
+            subject_id
+        ))
+
+        conn.commit()
+        conn.close()
+        
+        flash(
+            "Subject updated successfully.",
+            "success"
+        )
+
+        return redirect("/manage_subjects")
+
+    cursor.execute("""
+        SELECT *
+        FROM subjects
+        WHERE id=?
+    """, (subject_id,))
+
+    subject = cursor.fetchone()
+
+    conn.close()
+
+    if not subject:
+        abort(404)
+
+    return render_template(
+        "edit_subject.html",
+        subject=subject
+    )
+
+
+@admin_bp.route("/toggle_subject/<int:subject_id>", methods=["POST"])
+def toggle_subject(subject_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT status
+        FROM subjects
+        WHERE id=?
+    """, (subject_id,))
+
+    row = cursor.fetchone()
+
+    if not row:
+
+        conn.close()
+
+        flash(
+            "Subject not found.",
+            "danger"
+        )
+
+        return redirect("/manage_subjects")
+
+    if row[0] == "Active":
+
+        new_status = "Inactive"
+        flash_message = "✅ Subject deactivated successfully."
+
+    else:
+
+        new_status = "Active"
+        flash_message = "✅ Subject activated successfully."
+
+    cursor.execute("""
+        UPDATE subjects
+        SET status=?
+        WHERE id=?
+    """, (
+        new_status,
+        subject_id
+    ))
+
+    conn.commit()
+    conn.close()
+
+    flash(
+        flash_message,
+        "success"
+    )
+
+    return redirect("/manage_subjects")
+
+
+@admin_bp.route("/delete_subject/<int:subject_id>", methods=["POST"])
+def delete_subject(subject_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    # ------------------------------------------
+    # Check that subject exists
+    # ------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT subject_name, exam_type
+        FROM subjects
+        WHERE id=?
+        """,
+        (subject_id,)
+    )
+
+    subject = cursor.fetchone()
+
+    if not subject:
+        conn.close()
+        abort(404), 404
+
+    subject_name = subject[0]
+    exam_type = subject[1]
+
+    # ------------------------------------------
+    # Check for topics
+    # ------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM topics
+        WHERE subject_id=?
+        """,
+        (subject_id,)
+    )
+
+    topic_count = cursor.fetchone()[0]
+
+    if topic_count > 0:
+
+        conn.close()
+
+        return (
+            f"Cannot delete {exam_type} - {subject_name}. "
+            f"It has {topic_count} topic(s) attached. "
+            f"Remove the topics first."
+        )
+
+    # ------------------------------------------
+    # Check for questions
+    # ------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM questions_v2
+        WHERE subject_id=?
+        """,
+        (subject_id,)
+    )
+
+    question_count = cursor.fetchone()[0]
+
+    if question_count > 0:
+
+        conn.close()
+
+        return (
+            f"Cannot delete {exam_type} - {subject_name}. "
+            f"It has {question_count} question(s) attached."
+        )
+
+    # ------------------------------------------
+    # Delete subject
+    # ------------------------------------------
+
+    cursor.execute(
+        """
+        DELETE FROM subjects
+        WHERE id=?
+        """,
+        (subject_id,)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return redirect("/manage_subjects")
+
+
+@admin_bp.route("/manage_topics")
+def manage_topics():
+    search = request.args.get(
+        "search",
+        ""
+    ).strip()
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    query = """
+        SELECT
+            topics.id,
+            topics.topic_name,
+            topics.status,
+            topics.created_at,
+            subjects.subject_name,
+            subjects.exam_type
+        FROM topics
+        INNER JOIN subjects
+            ON topics.subject_id = subjects.id
+    """
+
+    params = []
+
+    if search:
+
+        query += """
+            WHERE
+                topics.topic_name LIKE ?
+                OR subjects.subject_name LIKE ?
+                OR subjects.exam_type LIKE ?
+        """
+
+        keyword = f"%{search}%"
+
+        params.extend([
+            keyword,
+            keyword,
+            keyword
+        ])
+
+    query += """
+        ORDER BY
+            subjects.exam_type,
+            subjects.subject_name,
+            topics.topic_name
+    """
+
+    cursor.execute(query, params)
+
+    topics = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "manage_topics.html",
+        topics=topics,
+        search=search
+    )
+
+
+@admin_bp.route("/add_topic", methods=["GET", "POST"])
+def add_topic():
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    if request.method == "POST":
+
+        subject_id = request.form["subject_id"]
+        topic_name = request.form["topic_name"].strip()
+
+        # Prevent duplicate topics under the same subject
+        cursor.execute(
+            """
+            SELECT id
+            FROM topics
+            WHERE subject_id=?
+            AND topic_name=?
+            """,
+            (
+                subject_id,
+                topic_name
+            )
+        )
+
+        existing = cursor.fetchone()
+
+        if existing:
+
+            conn.close()
+
+            flash(
+                "Topic already exists.",
+                "warning"
+            )
+
+            return redirect("/add_topic")
+
+        cursor.execute(
+            """
+            INSERT INTO topics
+            (
+                subject_id,
+                topic_name
+            )
+            VALUES (?, ?)
+            """,
+            (
+                subject_id,
+                topic_name
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+        flash(
+            "Topic added successfully.",
+            "success"
+        )
+
+        return redirect("/manage_topics")
+
+    cursor.execute("""
+        SELECT
+            id,
+            exam_type,
+            subject_name
+        FROM subjects
+        WHERE status='Active'
+        ORDER BY
+            exam_type,
+            subject_name
+    """)
+
+    subjects = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "add_topic.html",
+        subjects=subjects
+    )
+
+
+@admin_bp.route("/edit_topic/<int:topic_id>", methods=["GET", "POST"])
+def edit_topic(topic_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    if request.method == "POST":
+
+        subject_id = request.form["subject_id"]
+        topic_name = request.form["topic_name"].strip()
+        
+        # ------------------------------------
+        # Check for duplicate topic
+        # ------------------------------------
+
+        cursor.execute("""
+            SELECT id
+            FROM topics
+            WHERE
+                subject_id=?
+                AND topic_name=?
+                AND id<>?
+        """, (
+            subject_id,
+            topic_name,
+            topic_id
+        ))
+
+        existing = cursor.fetchone()
+
+        if existing:
+
+            conn.close()
+
+            flash(
+                "⚠️ Topic already exists for this subject.",
+                "warning"
+            )
+
+            return redirect(f"/edit_topic/{topic_id}")
+        
+
+        cursor.execute("""
+            UPDATE topics
+            SET
+                subject_id=?,
+                topic_name=?
+            WHERE id=?
+        """, (
+            subject_id,
+            topic_name,
+            topic_id
+        ))
+
+        conn.commit()
+        conn.close()
+
+        flash(
+            "Topic updated successfully.",
+            "success"
+        )
+
+        return redirect("/manage_topics")
+
+    cursor.execute("""
+        SELECT *
+        FROM topics
+        WHERE id=?
+    """, (topic_id,))
+
+    topic = cursor.fetchone()
+
+    if not topic:
+
+        conn.close()
+
+        abort(404)
+
+    cursor.execute("""
+        SELECT
+            id,
+            exam_type,
+            subject_name
+        FROM subjects
+        WHERE status='Active'
+        ORDER BY
+            exam_type,
+            subject_name
+    """)
+
+    subjects = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "edit_topic.html",
+        topic=topic,
+        subjects=subjects
+    )
+
+
+@admin_bp.route("/toggle_topic/<int:topic_id>", methods=["POST"])
+def toggle_topic(topic_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT status
+        FROM topics
+        WHERE id=?
+    """, (topic_id,))
+
+    row = cursor.fetchone()
+
+    if not row:
+
+        conn.close()
+
+        flash(
+            "Topic not found.",
+            "danger"
+        )
+
+        return redirect("/manage_topics")
+
+    if row[0] == "Active":
+
+        new_status = "Inactive"
+        flash_message = "✅ Topic deactivated successfully."
+
+    else:
+
+        new_status = "Active"
+        flash_message = "✅ Topic activated successfully."
+
+    cursor.execute("""
+        UPDATE topics
+        SET status=?
+        WHERE id=?
+    """, (
+        new_status,
+        topic_id
+    ))
+
+    conn.commit()
+    conn.close()
+
+    flash(
+        flash_message,
+        "success"
+    )
+
+    return redirect("/manage_topics")
+
+
+@admin_bp.route("/manage_subject_combinations")
+def manage_subject_combinations():
+    search = request.args.get(
+        "search",
+        ""
+    ).strip()
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    if search:
+
+        cursor.execute(
+            """
+            SELECT *
+            FROM post_utme_course_subjects
+            WHERE
+                course_name LIKE ?
+                OR subject_name LIKE ?
+            ORDER BY course_name
+            """,
+            (
+                f"%{search}%",
+                f"%{search}%"
+            )
+        )
+
+    else:
+
+        cursor.execute(
+            """
+            SELECT *
+            FROM post_utme_course_subjects
+            ORDER BY course_name
+            """
+        )
+
+    combinations = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "manage_subject_combinations.html",
+        combinations=combinations,
+        search=search
+    )
+
+
+@admin_bp.route(
+    "/add_subject_combination",
+    methods=["GET", "POST"]
+)
+def add_subject_combination():
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    if request.method == "POST":
+
+        course_name = request.form["course_name"]
+        subject_name = request.form["subject_name"]
+
+        # Prevent duplicates
+        cursor.execute(
+            """
+            SELECT id
+            FROM post_utme_course_subjects
+            WHERE
+                course_name=?
+                AND subject_name=?
+            """,
+            (
+                course_name,
+                subject_name
+            )
+        )
+
+        existing = cursor.fetchone()
+
+        if existing:
+
+            conn.close()
+
+            return "Subject combination already exists."
+
+        cursor.execute(
+            """
+            INSERT INTO post_utme_course_subjects
+            (
+                course_name,
+                subject_name
+            )
+            VALUES (?, ?)
+            """,
+            (
+                course_name,
+                subject_name
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+        return redirect(
+            "/manage_subject_combinations"
+        )
+
+    cursor.execute(
+        """
+        SELECT DISTINCT course_name
+        FROM post_utme_courses
+        ORDER BY course_name
+        """
+    )
+
+    courses = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "add_subject_combination.html",
+        courses=courses
+    )
+
+
+@admin_bp.route(
+    "/edit_subject_combination/<int:combination_id>",
+    methods=["GET", "POST"]
+)
+def edit_subject_combination(combination_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    if request.method == "POST":
+
+        course_name = request.form["course_name"]
+        subject_name = request.form["subject_name"]
+
+        cursor.execute(
+            """
+            UPDATE post_utme_course_subjects
+            SET
+                course_name=?,
+                subject_name=?
+            WHERE id=?
+            """,
+            (
+                course_name,
+                subject_name,
+                combination_id
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+        return redirect(
+            "/manage_subject_combinations"
+        )
+
+    # Current record
+    cursor.execute(
+        """
+        SELECT *
+        FROM post_utme_course_subjects
+        WHERE id=?
+        """,
+        (combination_id,)
+    )
+
+    combination = cursor.fetchone()
+
+    # Course dropdown
+    cursor.execute(
+        """
+        SELECT DISTINCT course_name
+        FROM post_utme_courses
+        ORDER BY course_name
+        """
+    )
+
+    courses = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "edit_subject_combination.html",
+        combination=combination,
+        courses=courses
+    )
+
+
+@admin_bp.route(
+    "/delete_subject_combination/<int:combination_id>",
+    methods=["GET", "POST"]
+)
+def delete_subject_combination(combination_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    if request.method == "POST":
+
+        cursor.execute(
+            """
+            DELETE FROM post_utme_course_subjects
+            WHERE id=?
+            """,
+            (combination_id,)
+        )
+
+        conn.commit()
+        conn.close()
+
+        return redirect(
+            "/manage_subject_combinations"
+        )
+
+    cursor.execute(
+        """
+        SELECT *
+        FROM post_utme_course_subjects
+        WHERE id=?
+        """,
+        (combination_id,)
+    )
+
+    combination = cursor.fetchone()
+
+    conn.close()
+
+    return render_template(
+        "delete_subject_combination.html",
+        combination=combination
+    )
+
+
+@admin_bp.route("/manage_students")
+def manage_students():
+    search = request.args.get(
+        "search",
+        ""
+    ).strip()
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    if search:
+
+        cursor.execute(
+            """
+            SELECT *
+            FROM users
+            WHERE
+                name LIKE ?
+                OR email LIKE ?
+                OR phone LIKE ?
+            ORDER BY id DESC
+            """,
+            (
+                f"%{search}%",
+                f"%{search}%",
+                f"%{search}%"
+            )
+        )
+
+    else:
+
+        cursor.execute(
+            """
+            SELECT *
+            FROM users
+            ORDER BY id DESC
+            """
+        )
+
+    students = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "manage_students.html",
+        students=students,
+        search=search
+    )
+
+
+@admin_bp.route("/reset_student_password/<int:user_id>", methods=["POST"])
+def reset_student_password(user_id):
+    """Generate a one-time temporary password for a student (shown to the admin once).
+
+    Used when a student forgets their password and the site cannot send reset e-mails
+    (free hosting blocks SMTP): the admin shares the temporary password on WhatsApp and
+    the student changes it from their profile after logging in.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    row = cursor.execute("SELECT id, name, email FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not row:
+        conn.close()
+        flash("Student not found.", "danger")
+        return redirect("/manage_students")
+    words = ("Nova", "Lagos", "Smart", "Bright", "Eagle", "Prime", "Focus", "Zenith", "Scholar", "Pioneer")
+    temp = f"{secrets.choice(words)}{secrets.choice(words)}{secrets.randbelow(9000) + 1000}!"
+    if password_problems(temp, row["email"], row["name"]):
+        conn.close()
+        flash("Could not generate a safe password automatically. Please try again.", "danger")
+        return redirect("/view_student/" + str(user_id))
+    cursor.execute("UPDATE users SET password = ? WHERE id = ?", (generate_password_hash(temp), user_id))
+    cursor.execute("UPDATE user_sessions SET is_active = 0 WHERE username = ?", (row["email"],))
+    # The student may be locked out from wrong attempts — a reset proves ownership.
+    cursor.execute("DELETE FROM login_attempts WHERE email = ? AND successful = 0", (row["email"],))
+    conn.commit()
+    conn.close()
+    _audit("student_password_reset", row["email"])
+    flash(f"Temporary password for {row['name'] or row['email']}:  {temp}  — send it to the student on "
+          f"WhatsApp. Ask them to change it after logging in (Profile → Change password).", "success")
+    return redirect("/manage_students")
+
+
+@admin_bp.route("/view_student/<int:user_id>")
+def view_student(user_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # Student information
+    cursor.execute("""
+        SELECT *
+        FROM users
+        WHERE id=?
+    """, (user_id,))
+
+    student = cursor.fetchone()
+
+    if not student:
+        conn.close()
+        abort(404)
+
+    # Student results
+    cursor.execute("""
+        SELECT *
+        FROM results
+        WHERE username=?
+        ORDER BY id DESC
+    """, (student["email"],))
+
+    results = cursor.fetchall()
+    
+    total_exams = len(results)
+
+    if total_exams > 0:
+
+        percentages = [r["percentage"] for r in results]
+
+        average_score = round(sum(percentages) / total_exams)
+
+        highest_score = max(percentages)
+
+        lowest_score = min(percentages)
+
+        pass_count = sum(
+            1 for r in results
+            if r["status"] == "PASS"
+        )
+
+        average_count = sum(
+            1 for r in results
+            if r["status"] == "AVERAGE"
+        )
+
+        fail_count = sum(
+            1 for r in results
+            if r["status"] == "FAIL"
+        )
+
+    else:
+
+        average_score = 0
+        highest_score = 0
+        lowest_score = 0
+
+        pass_count = 0
+        average_count = 0
+        fail_count = 0
+
+    conn.close()
+
+    return render_template(
+    "view_student.html",
+    student=student,
+    results=results,
+
+    total_exams=total_exams,
+    average_score=average_score,
+    highest_score=highest_score,
+    lowest_score=lowest_score,
+
+    pass_count=pass_count,
+    average_count=average_count,
+    fail_count=fail_count
+)
+
+
+@admin_bp.route("/suspend_student/<int:user_id>", methods=["POST"])
+def suspend_student(user_id):
+    _audit("suspend_student", user_id)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        UPDATE users
+        SET
+            status='SUSPENDED',
+            is_active=0
+        WHERE id=?
+        """,
+        (user_id,)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return redirect(
+        f"/view_student/{user_id}"
+    )
+
+
+@admin_bp.route("/activate_student/<int:user_id>", methods=["POST"])
+def activate_student(user_id):
+    _audit("activate_student", user_id)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        UPDATE users
+        SET
+            status='ACTIVE',
+            is_active=1
+        WHERE id=?
+        """,
+        (user_id,)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return redirect(
+        f"/view_student/{user_id}"
+    )
+
+
+@admin_bp.route("/delete_student/<int:user_id>")
+def delete_student(user_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT *
+        FROM users
+        WHERE id=?
+        """,
+        (user_id,)
+    )
+
+    student = cursor.fetchone()
+
+    conn.close()
+
+    if not student:
+        abort(404)
+
+    return render_template(
+        "delete_student.html",
+        student=student
+    )
+
+
+@admin_bp.route("/confirm_delete_student/<int:user_id>", methods=["POST"])
+def confirm_delete_student(user_id):
+    _audit("delete_student", user_id)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        DELETE FROM users
+        WHERE id=?
+        """,
+        (user_id,)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return redirect("/manage_students")
+
+
+@admin_bp.route("/manage_subscriptions")
+def manage_subscriptions():
+    """Subscriptions & payments overview + manual activation (bank transfer / support cases)."""
+    q = (request.args.get("q") or "").strip()
+    status = (request.args.get("status") or "all").strip().lower()
+    conn = connect()
+    cur = conn.cursor()
+    params = []
+    sql = """
+        SELECT u.id AS user_id, u.name, u.email, u.phone,
+               s.plan_name, s.start_date, s.end_date, s.is_active, s.payment_status, s.amount_paid, s.payment_reference
+        FROM users u
+        LEFT JOIN subscriptions s ON s.id = (SELECT id FROM subscriptions WHERE username = u.email ORDER BY id DESC LIMIT 1)
+    """
+    where = []
+    if q:
+        where.append("(u.name LIKE ? OR u.email LIKE ? OR u.phone LIKE ?)")
+        params += [f"%{q}%"] * 3
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY u.id DESC"
+    rows = []
+    now = datetime.now()
+    for r in cur.execute(sql, params).fetchall():
+        end = None
+        try:
+            end = datetime.strptime(r["end_date"], "%Y-%m-%d %H:%M:%S") if r["end_date"] else None
+        except ValueError:
+            end = None
+        if r["plan_name"] and r["is_active"] and end and end > now:
+            state = "trial" if r["payment_status"] == "FREE_TRIAL" else "active"
+        elif r["plan_name"]:
+            state = "expired"
+        else:
+            state = "none"
+        if status != "all" and state != status:
+            continue
+        rows.append({**dict(r), "state": state, "end": end, "days_left": max(0, (end - now).days) if end and end > now else 0})
+    plans = cur.execute("SELECT id, plan_name, price, duration_days FROM subscription_plans WHERE is_active = 1 ORDER BY duration_days").fetchall()
+    payments = cur.execute(
+        """SELECT p.username, u.name, p.plan_name, p.amount, p.payment_status, p.transaction_reference, p.payment_method, p.created_at, p.paid_at
+           FROM payments p LEFT JOIN users u ON u.email = p.username ORDER BY p.id DESC LIMIT 40"""
+    ).fetchall()
+    counts = {
+        "active": sum(1 for r in rows if r["state"] == "active"), "trial": sum(1 for r in rows if r["state"] == "trial"),
+        "expired": sum(1 for r in rows if r["state"] == "expired"), "none": sum(1 for r in rows if r["state"] == "none"),
+    }
+    revenue = cur.execute("SELECT COALESCE(SUM(amount), 0) FROM payments WHERE payment_status = 'SUCCESS'").fetchone()[0]
+    pending = cur.execute("SELECT COUNT(*) FROM payments WHERE payment_status = 'PENDING'").fetchone()[0]
+    conn.close()
+    return render_template("manage_subscriptions.html", rows=rows, plans=plans, payments=payments, q=q, status=status,
+                           counts=counts, revenue=revenue, pending=pending, paystack_ready=_paystack_ready())
+
+
+@admin_bp.route("/activate_subscription", methods=["POST"])
+def activate_subscription():
+    """Manually activate/extend a plan (e.g. paid by bank transfer or cash). Adds on top of any active time left."""
+    email = (request.form.get("email") or "").strip().lower()
+    note = (request.form.get("note") or "").strip()[:120]
+    try:
+        plan_id = int(request.form.get("plan_id") or 0)
+    except ValueError:
+        plan_id = 0
+    conn = connect()
+    cur = conn.cursor()
+    user = cur.execute("SELECT id, name, email FROM users WHERE lower(email) = ?", (email,)).fetchone()
+    plan = cur.execute("SELECT id, plan_name, price, duration_days FROM subscription_plans WHERE id = ? AND is_active = 1", (plan_id,)).fetchone()
+    if not user or not plan:
+        conn.close()
+        flash("Student e-mail or plan not recognised.", "danger")
+        return redirect(url_for("admin_bp.manage_subscriptions", q=email))
+    import secrets as _secrets
+    reference = f"MANUAL-{datetime.now():%Y%m%d}-{_secrets.token_hex(4).upper()}"
+    cur.execute(
+        """INSERT INTO payments (username, plan_id, plan_name, amount, duration_days, transaction_reference, payment_status,
+                                 payment_method, paid_at, currency, gateway_response)
+           VALUES (?, ?, ?, ?, ?, ?, 'SUCCESS', 'manual', CURRENT_TIMESTAMP, 'NGN', ?)""",
+        (user["email"], plan["id"], plan["plan_name"], plan["price"], plan["duration_days"], reference,
+         f"Activated by {session.get('admin')}" + (f": {note}" if note else "")),
+    )
+    start, end = grant_plan(cur, user["email"], plan["id"], plan["plan_name"], plan["duration_days"], plan["price"], "NGN", reference)
+    conn.commit()
+    conn.close()
+    _audit("activate_subscription", f"{user['email']} {plan['plan_name']} until {end:%Y-%m-%d}")
+    flash(f"{plan['plan_name']} plan activated for {user['name'] or user['email']} — expires {end:%d %b %Y}.", "success")
+    return redirect(url_for("admin_bp.manage_subscriptions", q=user["email"]))
+
+
+@admin_bp.route("/deactivate_subscription/<int:user_id>", methods=["POST"])
+def deactivate_subscription(user_id):
+    conn = connect()
+    user = conn.execute("SELECT email, name FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user:
+        conn.close()
+        abort(404)
+    conn.execute("UPDATE subscriptions SET is_active = 0 WHERE username = ?", (user["email"],))
+    conn.commit()
+    conn.close()
+    _audit("deactivate_subscription", user["email"])
+    flash(f"Subscription deactivated for {user['name'] or user['email']}.", "info")
+    return redirect(url_for("admin_bp.manage_subscriptions", q=user["email"]))
+
+
+# ---------------------------------------------------------------------------
+# Access PINs (vouchers)
+# ---------------------------------------------------------------------------
+
+def _codes_page(new_codes=None, new_days=None):
+    conn = connect()
+    cur = conn.cursor()
+    rows = cur.execute(
+        """SELECT c.*, (SELECT r.username FROM access_code_redemptions r WHERE r.code_id = c.id ORDER BY r.id DESC LIMIT 1) AS last_user
+           FROM access_codes c ORDER BY c.id DESC LIMIT 300"""
+    ).fetchall()
+    now = datetime.now()
+    codes = []
+    for r in rows:
+        expired = False
+        if r["expires_at"]:
+            try:
+                expired = datetime.strptime(r["expires_at"], "%Y-%m-%d %H:%M:%S") < now
+            except ValueError:
+                expired = False
+        if not r["is_active"] or expired:
+            state = "off"
+        elif r["uses"] >= r["max_uses"]:
+            state = "used"
+        else:
+            state = "live"
+        codes.append({**dict(r), "pretty": pretty_code(r["code"]), "state": state})
+    stats = {"live": sum(1 for c in codes if c["state"] == "live"),
+             "redeemed": cur.execute("SELECT COUNT(*) FROM access_code_redemptions").fetchone()[0]}
+    conn.close()
+    return render_template("access_codes.html", codes=codes, stats=stats, new_codes=[pretty_code(c) for c in (new_codes or [])], new_days=new_days)
+
+
+# ------------------------------------------------------------------ reported questions
+REPORT_LABELS = {
+    "wrong_answer": "Marked answer is wrong",
+    "typo": "Typo / unclear wording",
+    "no_correct": "No correct option / repeated options",
+    "explanation": "Explanation wrong or unhelpful",
+    "off_syllabus": "Not in syllabus",
+    "other": "Other",
+}
+
+
+def open_report_count():
+    try:
+        conn = connect()
+        n = conn.execute("SELECT COUNT(*) FROM question_reports WHERE status = 'open'").fetchone()[0]
+        conn.close()
+        return n
+    except sqlite3.Error:
+        return 0
+
+
+@admin_bp.app_context_processor
+def _inject_report_count():
+    # only pay for the query on admin pages (the bar is rendered there)
+    if session.get("admin"):
+        return {"open_report_count": open_report_count}
+    return {"open_report_count": lambda: 0}
+
+
+@admin_bp.route("/admin/question_reports")
+def question_reports():
+    from helpers import fetch_questions
+
+    status = request.args.get("status", "open")
+    if status not in ("open", "resolved", "dismissed", "all"):
+        status = "open"
+    conn = connect()
+    cur = conn.cursor()
+    where = "" if status == "all" else "WHERE r.status = ?"
+    params = [] if status == "all" else [status]
+    rows = cur.execute(
+        f"""SELECT r.*, u.name AS student_name FROM question_reports r LEFT JOIN users u ON u.email = r.username
+            {where} ORDER BY r.status = 'open' DESC, r.id DESC LIMIT 300""", params
+    ).fetchall()
+    by_source = {}
+    for r in rows:
+        by_source.setdefault(r["question_source"], set()).add(r["question_id"])
+    bank = {src: fetch_questions(cur, src, list(ids), with_answers=True) for src, ids in by_source.items()}
+    # how many separate students reported the same question (open reports only)
+    dup = {(d[0], d[1]): d[2] for d in cur.execute(
+        "SELECT question_source, question_id, COUNT(DISTINCT username) FROM question_reports WHERE status = 'open' GROUP BY 1, 2")}
+    counts = {k: v for k, v in cur.execute("SELECT status, COUNT(*) FROM question_reports GROUP BY status")}
+    conn.close()
+    items = []
+    for r in rows:
+        q = bank.get(r["question_source"], {}).get(r["question_id"])
+        items.append({**dict(r), "q": q, "reason_label": REPORT_LABELS.get(r["reason"], r["reason"]),
+                      "reporters": dup.get((r["question_source"], r["question_id"]), 0)})
+    return render_template("question_reports.html", items=items, status=status, counts=counts,
+                           total=sum(counts.values()))
+
+
+@admin_bp.route("/admin/question_reports/<int:report_id>", methods=["POST"])
+def resolve_question_report(report_id):
+    action = request.form.get("action", "")
+    note = " ".join((request.form.get("admin_note") or "").split())[:500] or None
+    conn = connect()
+    cur = conn.cursor()
+    r = cur.execute("SELECT * FROM question_reports WHERE id = ?", (report_id,)).fetchone()
+    if not r:
+        conn.close()
+        flash("Report not found.", "danger")
+        return redirect(url_for("admin_bp.question_reports"))
+    if action in ("resolved", "dismissed"):
+        # close every open report on the same question at once
+        cur.execute(
+            "UPDATE question_reports SET status = ?, admin_note = COALESCE(?, admin_note), resolved_at = CURRENT_TIMESTAMP "
+            "WHERE question_source = ? AND question_id = ? AND status = 'open'",
+            (action, note, r["question_source"], r["question_id"]),
+        )
+        msg = "Marked as fixed." if action == "resolved" else "Report dismissed."
+    elif action == "reopen":
+        cur.execute("UPDATE question_reports SET status = 'open', resolved_at = NULL WHERE id = ?", (report_id,))
+        msg = "Report reopened."
+    elif action == "deactivate" and r["question_source"] == "questions_v2":
+        cur.execute("UPDATE questions_v2 SET status = 'Inactive' WHERE id = ?", (r["question_id"],))
+        cur.execute(
+            "UPDATE question_reports SET status = 'resolved', admin_note = COALESCE(?, 'Question removed from the bank'), resolved_at = CURRENT_TIMESTAMP "
+            "WHERE question_source = ? AND question_id = ? AND status = 'open'",
+            (note, r["question_source"], r["question_id"]),
+        )
+        msg = f"Question #{r['question_id']} removed from the bank and the report closed."
+    else:
+        conn.close()
+        flash("Unknown action.", "warning")
+        return redirect(url_for("admin_bp.question_reports"))
+    conn.commit()
+    conn.close()
+    _audit(f"question_report:{action}", f"{r['question_source']}#{r['question_id']}")
+    flash(msg, "success")
+    return redirect(url_for("admin_bp.question_reports", status=request.form.get("back", "open")))
+
+
+@admin_bp.route("/manage_plans")
+def manage_plans():
+    """Prices students see on the landing page, the Subscribe page and in Paystack checkout."""
+    conn = connect()
+    plans = conn.execute("SELECT id, plan_name, price, duration_days, description, is_active FROM subscription_plans ORDER BY duration_days").fetchall()
+    sold = {r["plan_id"]: r["n"] for r in conn.execute("SELECT plan_id, COUNT(*) AS n FROM payments WHERE payment_status = 'SUCCESS' GROUP BY plan_id").fetchall()}
+    conn.close()
+    return render_template("manage_plans.html", plans=plans, sold=sold, paystack_ready=_paystack_ready())
+
+
+@admin_bp.route("/manage_plans/<int:plan_id>", methods=["POST"])
+def save_plan(plan_id):
+    try:
+        price = int(round(float((request.form.get("price") or "").replace(",", "").replace("₦", "").strip())))
+    except ValueError:
+        flash("Enter the price as a plain number, e.g. 1000.", "danger")
+        return redirect(url_for("admin_bp.manage_plans"))
+    if not 100 <= price <= 1_000_000:
+        flash("Price must be between ₦100 and ₦1,000,000.", "danger")
+        return redirect(url_for("admin_bp.manage_plans"))
+    description = (request.form.get("description") or "").strip()[:80]
+    is_active = 1 if request.form.get("is_active") else 0
+    conn = connect()
+    plan = conn.execute("SELECT plan_name, price FROM subscription_plans WHERE id = ?", (plan_id,)).fetchone()
+    if not plan:
+        conn.close()
+        abort(404)
+    if not is_active and conn.execute("SELECT COUNT(*) FROM subscription_plans WHERE is_active = 1 AND id != ?", (plan_id,)).fetchone()[0] == 0:
+        conn.close()
+        flash("At least one plan must stay switched on.", "danger")
+        return redirect(url_for("admin_bp.manage_plans"))
+    conn.execute("UPDATE subscription_plans SET price = ?, description = ?, is_active = ? WHERE id = ?", (price, description, is_active, plan_id))
+    conn.commit()
+    conn.close()
+    _audit("save_plan", f"{plan['plan_name']}: ₦{plan['price']:,.0f} -> ₦{price:,} {'on' if is_active else 'off'}")
+    flash(f"{plan['plan_name']} plan saved — students now see ₦{price:,}.", "success")
+    return redirect(url_for("admin_bp.manage_plans"))
+
+
+@admin_bp.route("/access_codes")
+def access_codes():
+    return _codes_page()
+
+
+@admin_bp.route("/access_codes/create", methods=["POST"])
+def create_access_codes():
+    try:
+        count = max(1, min(200, int(request.form.get("count") or 1)))
+        days = max(1, min(730, int(request.form.get("days") or 30)))
+        max_uses = max(1, min(10000, int(request.form.get("max_uses") or 1)))
+    except ValueError:
+        flash("Please enter whole numbers for count, days and uses.", "danger")
+        return redirect(url_for("admin_bp.access_codes"))
+    label = (request.form.get("label") or "").strip()[:40] or "Access PIN"
+    custom = (request.form.get("custom") or "").strip()
+    expires_raw = (request.form.get("expires") or "").strip()
+    expires_at = None
+    if expires_raw:
+        try:
+            expires_at = datetime.strptime(expires_raw, "%Y-%m-%d").replace(hour=23, minute=59, second=59).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            flash("The expiry date was not understood — PINs were not created.", "danger")
+            return redirect(url_for("admin_bp.access_codes"))
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        made = generate_access_codes(cur, count, days, label, max_uses, expires_at, session.get("admin"), custom=custom or None)
+        conn.commit()
+    except ValueError as exc:
+        conn.close()
+        flash(str(exc), "danger")
+        return redirect(url_for("admin_bp.access_codes"))
+    conn.close()
+    _audit("create_access_codes", f"{len(made)} x {days}d '{label}' uses={max_uses}")
+    return _codes_page(new_codes=made, new_days=days)
+
+
+@admin_bp.route("/access_codes/<int:code_id>/toggle", methods=["POST"])
+def toggle_access_code(code_id):
+    conn = connect()
+    row = conn.execute("SELECT is_active, code FROM access_codes WHERE id = ?", (code_id,)).fetchone()
+    if row:
+        conn.execute("UPDATE access_codes SET is_active = ? WHERE id = ?", (0 if row["is_active"] else 1, code_id))
+        conn.commit()
+        _audit("toggle_access_code", f"{row['code']} -> {'off' if row['is_active'] else 'on'}")
+    conn.close()
+    return redirect(url_for("admin_bp.access_codes"))
+
+
+@admin_bp.route("/manage_results")
+def manage_results():
+    search = request.args.get("search", "").strip()
+
+    exam_type = request.args.get("exam_type", "").strip()
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    conditions = []
+    params = []
+
+    if search:
+
+        conditions.append(
+            "(username LIKE ? OR exam_name LIKE ?)"
+        )
+
+        params.extend([
+            f"%{search}%",
+            f"%{search}%"
+        ])
+
+    if exam_type:
+
+        conditions.append(
+            "exam_type=?"
+        )
+
+        params.append(exam_type)
+
+    where_clause = ""
+
+    if conditions:
+        where_clause = (
+            "WHERE " + " AND ".join(conditions)
+        )
+
+    query = f"""
+        SELECT *
+        FROM results
+        {where_clause}
+        ORDER BY id DESC
+    """
+
+    cursor.execute(query, params)
+
+    results = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "manage_results.html",
+        results=results,
+        search=search,
+        exam_type=exam_type
+    )
+
+
+@admin_bp.route("/view_result/<int:result_id>")
+def view_result(result_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT *
+        FROM results
+        WHERE id=?
+        """,
+        (result_id,)
+    )
+
+    result = cursor.fetchone()
+
+    conn.close()
+
+    if not result:
+        abort(404)
+
+    return render_template(
+        "view_result.html",
+        result=result
+    )
+
+
+@admin_bp.route("/review_result/<int:result_id>")
+def review_result(result_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT *
+        FROM review_answers
+        WHERE result_id=?
+        """,
+        (result_id,)
+    )
+
+    answers = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "review_result.html",
+        answers=answers,
+        result_id=result_id
+    )
+
+
+@admin_bp.route("/admin")
+def admin():
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    # Students
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_students = cursor.fetchone()[0]
+
+    cursor.execute(
+        "SELECT COUNT(*) FROM users WHERE is_active=1"
+    )
+    active_students = cursor.fetchone()[0]
+
+    cursor.execute(
+        "SELECT COUNT(*) FROM users WHERE is_active=0"
+    )
+    suspended_students = cursor.fetchone()[0]
+
+    # WAEC Questions (inactive legacy seed rows are excluded)
+    cursor.execute(
+        "SELECT COUNT(*) FROM questions WHERE exam_type='WAEC' AND COALESCE(status, 'Active') = 'Active'"
+    )
+    waec_questions = cursor.fetchone()[0]
+
+    # JAMB Questions
+    cursor.execute(
+        "SELECT COUNT(*) FROM questions WHERE exam_type='JAMB' AND COALESCE(status, 'Active') = 'Active'"
+    )
+    jamb_questions = cursor.fetchone()[0]
+
+    # POST-UTME Questions
+    cursor.execute(
+        "SELECT COUNT(*) FROM post_utme_questions"
+    )
+    post_utme_questions = cursor.fetchone()[0]
+    post_utme_universities = cursor.execute(
+        "SELECT COUNT(*) FROM post_utme_universities WHERE COALESCE(status, 'Active') = 'Active'"
+    ).fetchone()[0]
+
+    # Results
+    cursor.execute(
+        "SELECT COUNT(*) FROM results"
+    )
+    total_results = cursor.fetchone()[0]
+    
+    # Overall Performance Statistics
+
+    cursor.execute("""
+        SELECT
+            COUNT(*),
+            AVG(percentage),
+            MAX(percentage),
+            MIN(percentage)
+        FROM results
+    """)
+
+    stats = cursor.fetchone()
+
+    total_exams_taken = stats[0] if stats[0] else 0
+
+    average_score = round(stats[1]) if stats[1] else 0
+
+    highest_score = stats[2] if stats[2] else 0
+
+    lowest_score = stats[3] if stats[3] else 0
+
+
+    # Pass Rate
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM results
+        WHERE status='PASS'
+    """)
+
+    passed = cursor.fetchone()[0]
+
+    if total_exams_taken > 0:
+        pass_rate = round((passed / total_exams_taken) * 100)
+    else:
+        pass_rate = 0
+
+    conn.close()
+
+    return render_template(
+    "admin_dashboard.html",
+
+    open_reports=open_report_count(),
+    total_students=total_students,
+    active_students=active_students,
+    suspended_students=suspended_students,
+
+    waec_questions=waec_questions,
+    jamb_questions=jamb_questions,
+    post_utme_questions=post_utme_questions,
+    post_utme_universities=post_utme_universities,
+
+    total_results=total_results,
+
+    total_exams_taken=total_exams_taken,
+    average_score=average_score,
+    highest_score=highest_score,
+    lowest_score=lowest_score,
+    pass_rate=pass_rate
+)
+
+
+@admin_bp.route("/admin/results")
+def admin_results():
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            id,
+            username,
+            exam_type,
+            exam_name,
+            score,
+            total,
+            percentage,
+            duration,
+            status,
+            verification_code,
+            date_taken
+        FROM results
+        ORDER BY id DESC
+    """)
+
+    results = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "admin_results.html",
+        results=results
+    )
+
+
+@admin_bp.route("/admin_questions", methods=["GET", "POST"])
+def admin_questions():
+    if request.method == "POST":
+
+        exam_type = request.form["exam_type"]
+        subject = request.form["subject"]
+        question = request.form["question"]
+
+        option_a = request.form["option_a"]
+        option_b = request.form["option_b"]
+        option_c = request.form["option_c"]
+        option_d = request.form["option_d"]
+
+        correct_answer = request.form["correct_answer"]
+        explanation = request.form["explanation"]
+
+        conn = sqlite3.connect(DB_PATH, timeout=15)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT *
+            FROM questions
+            WHERE exam_type=?
+            AND subject=?
+            AND question_text=?
+            """,
+            (
+                exam_type,
+                subject,
+                question
+            )
+        )
+
+        existing_question = cursor.fetchone()
+
+        if existing_question:
+
+            conn.close()
+
+            return "Question already exists!"
+
+        cursor.execute(
+            """
+            INSERT INTO questions
+            (
+                exam_type,
+                subject,
+                question_text,
+                option_a,
+                option_b,
+                option_c,
+                option_d,
+                correct_answer,
+                explanation
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                exam_type,
+                subject,
+                question,
+                option_a,
+                option_b,
+                option_c,
+                option_d,
+                correct_answer,
+                explanation
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+        return "Question Added Successfully!"
+
+    return render_template("admin.html")
+
+
+@admin_bp.route("/admin_questions_v2", methods=["GET", "POST"])
+def admin_questions_v2():
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # ==========================================
+    # SAVE QUESTION
+    # ==========================================
+
+    if request.method == "POST":
+
+        exam_type_id = request.form.get("exam_type_id", "").strip()
+        subject_id = request.form.get("subject_id", "").strip()
+        topic_id = request.form.get("topic_id", "").strip()
+
+        question_type = request.form.get(
+            "question_type",
+            "Objective"
+        ).strip()
+
+        difficulty = request.form.get(
+            "difficulty",
+            "Medium"
+        ).strip()
+
+        question_text = request.form.get(
+            "question_text",
+            ""
+        ).strip()
+
+        option_a = request.form.get(
+            "option_a",
+            ""
+        ).strip()
+
+        option_b = request.form.get(
+            "option_b",
+            ""
+        ).strip()
+
+        option_c = request.form.get(
+            "option_c",
+            ""
+        ).strip()
+
+        option_d = request.form.get(
+            "option_d",
+            ""
+        ).strip()
+
+        correct_answer = request.form.get(
+            "correct_answer",
+            ""
+        ).strip()
+
+        explanation = request.form.get(
+            "explanation",
+            ""
+        ).strip()
+
+        # ==========================================
+        # VALIDATION
+        # ==========================================
+
+        if not exam_type_id or not subject_id or not topic_id:
+
+            conn.close()
+
+            flash(
+                "⚠️ Please select Exam Type, Subject and Topic.",
+                "warning"
+            )
+
+            return redirect("/admin_questions_v2")
+
+        if not question_text:
+
+            conn.close()
+
+            flash(
+                "⚠️ Question text is required.",
+                "warning"
+            )
+
+            return redirect("/admin_questions_v2")
+
+        if not option_a or not option_b or not option_c or not option_d:
+
+            conn.close()
+
+            flash(
+                "⚠️ All four answer options are required.",
+                "warning"
+            )
+
+            return redirect("/admin_questions_v2")
+
+        if correct_answer not in ["A", "B", "C", "D"]:
+
+            conn.close()
+
+            flash(
+                "⚠️ Please select a valid correct answer.",
+                "warning"
+            )
+
+            return redirect("/admin_questions_v2")
+
+        # ==========================================
+        # VERIFY EXAM TYPE + SUBJECT RELATIONSHIP
+        # ==========================================
+
+        cursor.execute("""
+            SELECT id
+            FROM subjects
+            WHERE id=?
+            AND exam_type_id=?
+            AND status='Active'
+        """, (
+            subject_id,
+            exam_type_id
+        ))
+
+        valid_subject = cursor.fetchone()
+
+        if not valid_subject:
+
+            conn.close()
+
+            flash(
+                "❌ Invalid Subject for the selected Exam Type.",
+                "danger"
+            )
+
+            return redirect("/admin_questions_v2")
+
+        # ==========================================
+        # VERIFY TOPIC + SUBJECT RELATIONSHIP
+        # ==========================================
+
+        cursor.execute("""
+            SELECT id
+            FROM topics
+            WHERE id=?
+            AND subject_id=?
+            AND status='Active'
+        """, (
+            topic_id,
+            subject_id
+        ))
+
+        valid_topic = cursor.fetchone()
+
+        if not valid_topic:
+
+            conn.close()
+
+            flash(
+                "❌ Invalid Topic for the selected Subject.",
+                "danger"
+            )
+
+            return redirect("/admin_questions_v2")
+
+        # ==========================================
+        # DUPLICATE QUESTION PROTECTION
+        # ==========================================
+
+        cursor.execute("""
+            SELECT id
+            FROM questions_v2
+            WHERE exam_type_id=?
+            AND subject_id=?
+            AND topic_id=?
+            AND question_text=?
+        """, (
+            exam_type_id,
+            subject_id,
+            topic_id,
+            question_text
+        ))
+
+        existing_question = cursor.fetchone()
+
+        if existing_question:
+
+            conn.close()
+
+            flash(
+                "⚠️ Question already exists.",
+                "warning"
+            )
+
+            return redirect("/admin_questions_v2")
+
+        # ==========================================
+        # INSERT QUESTION
+        # ==========================================
+
+        try:
+
+            cursor.execute("""
+                INSERT INTO questions_v2
+                (
+                    exam_type_id,
+                    subject_id,
+                    topic_id,
+                    question_type,
+                    difficulty,
+                    question_text,
+                    option_a,
+                    option_b,
+                    option_c,
+                    option_d,
+                    correct_answer,
+                    explanation,
+                    status,
+                    tier
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """, (
+                exam_type_id,
+                subject_id,
+                topic_id,
+                question_type,
+                difficulty,
+                question_text,
+                option_a,
+                option_b,
+                option_c,
+                option_d,
+                correct_answer,
+                explanation,
+                "Active"
+            ))
+
+            conn.commit()
+            conn.close()
+
+            flash(
+                "✅ Question added successfully.",
+                "success"
+            )
+
+            return redirect("/admin_questions_v2")
+
+        except Exception as e:
+
+            conn.rollback()
+            conn.close()
+
+            print("QUESTION V2 ERROR:", e)
+
+            flash(
+                "❌ Failed to save question.",
+                "danger"
+            )
+
+            return redirect("/admin_questions_v2")
+
+    # ==========================================
+    # LOAD EXAM TYPES
+    # ==========================================
+
+    cursor.execute("""
+        SELECT
+            id,
+            exam_name
+        FROM exam_types
+        WHERE status='Active'
+        ORDER BY exam_name
+    """)
+
+    exam_types = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "admin_questions_v2.html",
+        exam_types=exam_types
+    )
+
+
+@admin_bp.route("/manage_questions_v2")
+def manage_questions_v2():
+    search = request.args.get(
+        "search",
+        ""
+    ).strip()
+
+    exam_type_id = request.args.get(
+        "exam_type_id",
+        ""
+    ).strip()
+
+    subject_id = request.args.get(
+        "subject_id",
+        ""
+    ).strip()
+
+    topic_id = request.args.get(
+        "topic_id",
+        ""
+    ).strip()
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # ==========================================
+    # VALIDATE EXAM TYPE
+    # ==========================================
+
+    if exam_type_id:
+
+        cursor.execute("""
+            SELECT id
+            FROM exam_types
+            WHERE id=?
+            AND status='Active'
+        """, (exam_type_id,))
+
+        valid_exam = cursor.fetchone()
+
+        if not valid_exam:
+
+            exam_type_id = ""
+
+            flash(
+                "⚠️ Invalid exam type filter.",
+                "warning"
+            )
+
+    # ==========================================
+    # VALIDATE SUBJECT
+    # ==========================================
+
+    if subject_id:
+
+        if exam_type_id:
+
+            cursor.execute("""
+                SELECT id
+                FROM subjects
+                WHERE id=?
+                AND exam_type_id=?
+                AND status='Active'
+            """, (
+                subject_id,
+                exam_type_id
+            ))
+
+        else:
+
+            cursor.execute("""
+                SELECT id
+                FROM subjects
+                WHERE id=?
+                AND status='Active'
+            """, (
+                subject_id,
+            ))
+
+        valid_subject = cursor.fetchone()
+
+        if not valid_subject:
+
+            subject_id = ""
+
+            topic_id = ""
+
+            flash(
+                "⚠️ Invalid subject filter for the selected exam.",
+                "warning"
+            )
+
+    # ==========================================
+    # VALIDATE TOPIC
+    # ==========================================
+
+    if topic_id:
+
+        if subject_id:
+
+            cursor.execute("""
+                SELECT id
+                FROM topics
+                WHERE id=?
+                AND subject_id=?
+                AND status='Active'
+            """, (
+                topic_id,
+                subject_id
+            ))
+
+        else:
+
+            cursor.execute("""
+                SELECT id
+                FROM topics
+                WHERE id=?
+                AND status='Active'
+            """, (
+                topic_id,
+            ))
+
+        valid_topic = cursor.fetchone()
+
+        if not valid_topic:
+
+            topic_id = ""
+
+            flash(
+                "⚠️ Invalid topic filter for the selected subject.",
+                "warning"
+            )
+
+    # ==========================================
+    # LOAD QUESTIONS
+    # ==========================================
+
+    query = """
+        SELECT
+
+            q.id,
+
+            q.question_text,
+
+            q.question_type,
+
+            q.difficulty,
+
+            q.correct_answer,
+
+            q.status,
+
+            q.created_at,
+
+            e.exam_name,
+
+            s.subject_name,
+
+            t.topic_name
+
+        FROM questions_v2 q
+
+        JOIN exam_types e
+            ON q.exam_type_id = e.id
+
+        JOIN subjects s
+            ON q.subject_id = s.id
+
+        JOIN topics t
+            ON q.topic_id = t.id
+
+        WHERE 1=1
+    """
+
+    params = []
+
+    # ==========================================
+    # SEARCH
+    # ==========================================
+
+    if search:
+
+        query += """
+            AND q.question_text LIKE ?
+        """
+
+        params.append(
+            f"%{search}%"
+        )
+
+    # ==========================================
+    # EXAM TYPE FILTER
+    # ==========================================
+
+    if exam_type_id:
+
+        query += """
+            AND q.exam_type_id=?
+        """
+
+        params.append(
+            exam_type_id
+        )
+
+    # ==========================================
+    # SUBJECT FILTER
+    # ==========================================
+
+    if subject_id:
+
+        query += """
+            AND q.subject_id=?
+        """
+
+        params.append(
+            subject_id
+        )
+
+    # ==========================================
+    # TOPIC FILTER
+    # ==========================================
+
+    if topic_id:
+
+        query += """
+            AND q.topic_id=?
+        """
+
+        params.append(
+            topic_id
+        )
+
+    # ==========================================
+    # ORDER
+    # ==========================================
+
+    query += """
+        ORDER BY q.id DESC
+    """
+
+    cursor.execute(
+        query,
+        params
+    )
+
+    questions = cursor.fetchall()
+
+    # ==========================================
+    # LOAD ACTIVE EXAM TYPES
+    # ==========================================
+
+    cursor.execute("""
+        SELECT
+            id,
+            exam_name
+        FROM exam_types
+        WHERE status='Active'
+        ORDER BY exam_name
+    """)
+
+    exam_types = cursor.fetchall()
+
+    # ==========================================
+    # LOAD ACTIVE SUBJECTS
+    # ==========================================
+
+    cursor.execute("""
+        SELECT
+            id,
+            subject_name,
+            exam_type_id
+        FROM subjects
+        WHERE status='Active'
+        ORDER BY subject_name
+    """)
+
+    subjects = cursor.fetchall()
+
+    # ==========================================
+    # LOAD ACTIVE TOPICS
+    # ==========================================
+
+    cursor.execute("""
+        SELECT
+            id,
+            topic_name,
+            subject_id
+        FROM topics
+        WHERE status='Active'
+        ORDER BY topic_name
+    """)
+
+    topics = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "manage_questions_v2.html",
+
+        questions=questions,
+
+        exam_types=exam_types,
+
+        subjects=subjects,
+
+        topics=topics,
+
+        search=search,
+
+        selected_exam_type=exam_type_id,
+
+        selected_subject=subject_id,
+
+        selected_topic=topic_id
+    )
+
+
+@admin_bp.route("/question_bank_v2")
+def question_bank_v2():
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # ==========================================
+    # GET FILTER VALUES
+    # ==========================================
+
+    exam_type_id = request.args.get(
+        "exam_type_id",
+        ""
+    ).strip()
+
+    subject_id = request.args.get(
+        "subject_id",
+        ""
+    ).strip()
+
+    topic_id = request.args.get(
+        "topic_id",
+        ""
+    ).strip()
+
+    question_type = request.args.get(
+        "question_type",
+        ""
+    ).strip()
+
+    difficulty = request.args.get(
+        "difficulty",
+        ""
+    ).strip()
+
+    status = request.args.get(
+        "status",
+        ""
+    ).strip()
+
+    search = request.args.get(
+        "search",
+        ""
+    ).strip()
+
+
+    # ==========================================
+    # PAGINATION
+    # ==========================================
+
+    try:
+
+        page = int(
+            request.args.get(
+                "page",
+                1
+            )
+        )
+
+    except ValueError:
+
+        page = 1
+
+
+    if page < 1:
+
+        page = 1
+
+
+    # Number of questions per page
+
+    per_page = 25
+
+
+    # ==========================================
+    # BUILD BASE QUERY
+    # ==========================================
+
+    base_query = """
+        FROM questions_v2 q
+
+        LEFT JOIN exam_types e
+            ON q.exam_type_id = e.id
+
+        LEFT JOIN subjects s
+            ON q.subject_id = s.id
+
+        LEFT JOIN topics t
+            ON q.topic_id = t.id
+
+        WHERE 1=1
+    """
+
+    params = []
+
+
+    # ==========================================
+    # EXAM TYPE FILTER
+    # ==========================================
+
+    if exam_type_id:
+
+        base_query += """
+            AND q.exam_type_id=?
+        """
+
+        params.append(
+            exam_type_id
+        )
+
+
+    # ==========================================
+    # SUBJECT FILTER
+    # ==========================================
+
+    if subject_id:
+
+        base_query += """
+            AND q.subject_id=?
+        """
+
+        params.append(
+            subject_id
+        )
+
+
+    # ==========================================
+    # TOPIC FILTER
+    # ==========================================
+
+    if topic_id:
+
+        base_query += """
+            AND q.topic_id=?
+        """
+
+        params.append(
+            topic_id
+        )
+
+
+    # ==========================================
+    # QUESTION TYPE FILTER
+    # ==========================================
+
+    if question_type:
+
+        base_query += """
+            AND q.question_type=?
+        """
+
+        params.append(
+            question_type
+        )
+
+
+    # ==========================================
+    # DIFFICULTY FILTER
+    # ==========================================
+
+    if difficulty:
+
+        base_query += """
+            AND q.difficulty=?
+        """
+
+        params.append(
+            difficulty
+        )
+
+
+    # ==========================================
+    # STATUS FILTER
+    # ==========================================
+
+    if status:
+
+        base_query += """
+            AND q.status=?
+        """
+
+        params.append(
+            status
+        )
+
+
+    # ==========================================
+    # SEARCH FILTER
+    # ==========================================
+
+    if search:
+
+        base_query += """
+            AND (
+                q.question_text LIKE ?
+                OR s.subject_name LIKE ?
+                OR t.topic_name LIKE ?
+            )
+        """
+
+        search_value = f"%{search}%"
+
+        params.extend([
+            search_value,
+            search_value,
+            search_value
+        ])
+
+
+    # ==========================================
+    # TOTAL QUESTIONS
+    # ==========================================
+
+    cursor.execute(
+        "SELECT COUNT(*) " + base_query,
+        params
+    )
+
+    total_questions = cursor.fetchone()[0]
+
+
+    # ==========================================
+    # ACTIVE QUESTIONS
+    #
+    # Uses the SAME filters
+    # ==========================================
+
+    active_query = (
+        "SELECT COUNT(*) "
+        + base_query
+        + " AND q.status='Active'"
+    )
+
+    cursor.execute(
+        active_query,
+        params
+    )
+
+    active_questions = cursor.fetchone()[0]
+
+
+    # ==========================================
+    # INACTIVE QUESTIONS
+    #
+    # Uses the SAME filters
+    # ==========================================
+
+    inactive_query = (
+        "SELECT COUNT(*) "
+        + base_query
+        + " AND q.status='Inactive'"
+    )
+
+    cursor.execute(
+        inactive_query,
+        params
+    )
+
+    inactive_questions = cursor.fetchone()[0]
+
+
+    # ==========================================
+    # CALCULATE PAGINATION
+    # ==========================================
+
+    total_pages = (
+        (total_questions + per_page - 1)
+        // per_page
+    )
+
+
+    # Make sure page is valid
+
+    if total_pages > 0 and page > total_pages:
+
+        page = total_pages
+
+
+    if total_pages == 0:
+
+        page = 1
+
+
+    offset = (
+        (page - 1)
+        * per_page
+    )
+
+
+    # ==========================================
+    # GET QUESTIONS FOR CURRENT PAGE
+    # ==========================================
+
+    question_query = """
+        SELECT
+
+            q.id,
+
+            q.exam_type_id,
+
+            q.subject_id,
+
+            q.topic_id,
+
+            q.question_type,
+
+            q.difficulty,
+
+            q.question_text,
+
+            q.status,
+
+            e.exam_name,
+
+            s.subject_name,
+
+            t.topic_name
+
+    """ + base_query + """
+
+        ORDER BY q.id DESC
+
+        LIMIT ? OFFSET ?
+    """
+
+
+    question_params = list(params)
+
+    question_params.extend([
+        per_page,
+        offset
+    ])
+
+
+    cursor.execute(
+        question_query,
+        question_params
+    )
+
+    questions = cursor.fetchall()
+
+
+    # ==========================================
+    # LOAD EXAM TYPES
+    # ==========================================
+
+    cursor.execute("""
+        SELECT
+            id,
+            exam_name
+
+        FROM exam_types
+
+        WHERE status='Active'
+
+        ORDER BY exam_name
+    """)
+
+    exam_types = cursor.fetchall()
+
+
+    # ==========================================
+    # LOAD ACTIVE SUBJECTS
+    # ==========================================
+
+    cursor.execute("""
+        SELECT
+            id,
+            subject_name,
+            exam_type_id
+
+        FROM subjects
+
+        WHERE status='Active'
+
+        ORDER BY subject_name
+    """)
+
+    subjects = cursor.fetchall()
+
+
+    # ==========================================
+    # LOAD ACTIVE TOPICS
+    # ==========================================
+
+    cursor.execute("""
+        SELECT
+            id,
+            topic_name,
+            subject_id
+
+        FROM topics
+
+        WHERE status='Active'
+
+        ORDER BY topic_name
+    """)
+
+    topics = cursor.fetchall()
+
+
+    # ==========================================
+    # CLOSE DATABASE
+    # ==========================================
+
+    conn.close()
+
+
+    # ==========================================
+    # RENDER PAGE
+    # ==========================================
+
+    return render_template(
+
+        "question_bank_v2.html",
+
+        questions=questions,
+
+        exam_types=exam_types,
+
+        subjects=subjects,
+
+        topics=topics,
+
+        exam_type_id=exam_type_id,
+
+        subject_id=subject_id,
+
+        topic_id=topic_id,
+
+        question_type=question_type,
+
+        difficulty=difficulty,
+
+        status=status,
+
+        search=search,
+
+        page=page,
+
+        per_page=per_page,
+
+        total_questions=total_questions,
+
+        active_questions=active_questions,
+
+        inactive_questions=inactive_questions,
+
+        total_pages=total_pages
+
+    )
+
+
+@admin_bp.route("/view_question_v2/<int:question_id>")
+def view_question_v2(question_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+
+            q.id,
+
+            q.question_text,
+
+            q.option_a,
+            q.option_b,
+            q.option_c,
+            q.option_d,
+
+            q.correct_answer,
+
+            q.explanation,
+
+            q.question_type,
+
+            q.difficulty,
+
+            q.status,
+
+            q.created_at,
+
+            e.exam_name,
+
+            s.subject_name,
+
+            t.topic_name
+
+        FROM questions_v2 q
+
+        INNER JOIN exam_types e
+            ON q.exam_type_id = e.id
+
+        INNER JOIN subjects s
+            ON q.subject_id = s.id
+
+        INNER JOIN topics t
+            ON q.topic_id = t.id
+
+        WHERE q.id = ?
+
+    """, (question_id,))
+
+    question = cursor.fetchone()
+
+    conn.close()
+
+    # ==========================================
+    # QUESTION NOT FOUND
+    # ==========================================
+
+    if not question:
+
+        flash(
+            "❌ Question not found.",
+            "danger"
+        )
+
+        return redirect("/question_bank_v2")
+
+    return render_template(
+        "view_question_v2.html",
+        question=question
+    )
+
+
+@admin_bp.route(
+    "/edit_question_v2/<int:question_id>",
+    methods=["GET", "POST"]
+)
+def edit_question_v2(question_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # ==========================================
+    # GET EXISTING QUESTION
+    # ==========================================
+
+    cursor.execute("""
+        SELECT *
+        FROM questions_v2
+        WHERE id=?
+    """, (question_id,))
+
+    question = cursor.fetchone()
+
+    if not question:
+
+        conn.close()
+
+        flash(
+            "❌ Question not found.",
+            "danger"
+        )
+
+        return redirect("/question_bank_v2")
+
+
+    # ==========================================
+    # UPDATE QUESTION
+    # ==========================================
+
+    if request.method == "POST":
+
+        exam_type_id = request.form.get(
+            "exam_type_id",
+            ""
+        ).strip()
+
+        subject_id = request.form.get(
+            "subject_id",
+            ""
+        ).strip()
+
+        topic_id = request.form.get(
+            "topic_id",
+            ""
+        ).strip()
+
+        question_type = request.form.get(
+            "question_type",
+            "Objective"
+        ).strip()
+
+        difficulty = request.form.get(
+            "difficulty",
+            "Medium"
+        ).strip()
+
+        question_text = request.form.get(
+            "question_text",
+            ""
+        ).strip()
+
+        option_a = request.form.get(
+            "option_a",
+            ""
+        ).strip()
+
+        option_b = request.form.get(
+            "option_b",
+            ""
+        ).strip()
+
+        option_c = request.form.get(
+            "option_c",
+            ""
+        ).strip()
+
+        option_d = request.form.get(
+            "option_d",
+            ""
+        ).strip()
+
+        correct_answer = request.form.get(
+            "correct_answer",
+            ""
+        ).strip().upper()
+
+        explanation = request.form.get(
+            "explanation",
+            ""
+        ).strip()
+
+        status = request.form.get(
+            "status",
+            "Active"
+        ).strip()
+
+
+        # ==========================================
+        # BASIC VALIDATION
+        # ==========================================
+
+        if not exam_type_id:
+
+            conn.close()
+
+            flash(
+                "⚠️ Please select an Exam Type.",
+                "warning"
+            )
+
+            return redirect(
+                f"/edit_question_v2/{question_id}"
+            )
+
+
+        if not subject_id:
+
+            conn.close()
+
+            flash(
+                "⚠️ Please select a Subject.",
+                "warning"
+            )
+
+            return redirect(
+                f"/edit_question_v2/{question_id}"
+            )
+
+
+        if not topic_id:
+
+            conn.close()
+
+            flash(
+                "⚠️ Please select a Topic.",
+                "warning"
+            )
+
+            return redirect(
+                f"/edit_question_v2/{question_id}"
+            )
+
+
+        if not question_text:
+
+            conn.close()
+
+            flash(
+                "⚠️ Question text is required.",
+                "warning"
+            )
+
+            return redirect(
+                f"/edit_question_v2/{question_id}"
+            )
+
+
+        if (
+            not option_a
+            or not option_b
+            or not option_c
+            or not option_d
+        ):
+
+            conn.close()
+
+            flash(
+                "⚠️ All four answer options are required.",
+                "warning"
+            )
+
+            return redirect(
+                f"/edit_question_v2/{question_id}"
+            )
+
+
+        if correct_answer not in [
+            "A",
+            "B",
+            "C",
+            "D"
+        ]:
+
+            conn.close()
+
+            flash(
+                "⚠️ Please select a valid correct answer.",
+                "warning"
+            )
+
+            return redirect(
+                f"/edit_question_v2/{question_id}"
+            )
+
+
+        if question_type not in [
+            "Objective",
+            "Theory"
+        ]:
+
+            conn.close()
+
+            flash(
+                "⚠️ Invalid question type.",
+                "warning"
+            )
+
+            return redirect(
+                f"/edit_question_v2/{question_id}"
+            )
+
+
+        if difficulty not in [
+            "Easy",
+            "Medium",
+            "Hard"
+        ]:
+
+            conn.close()
+
+            flash(
+                "⚠️ Invalid difficulty level.",
+                "warning"
+            )
+
+            return redirect(
+                f"/edit_question_v2/{question_id}"
+            )
+
+
+        if status not in [
+            "Active",
+            "Inactive"
+        ]:
+
+            conn.close()
+
+            flash(
+                "⚠️ Invalid question status.",
+                "warning"
+            )
+
+            return redirect(
+                f"/edit_question_v2/{question_id}"
+            )
+
+
+        # ==========================================
+        # VERIFY EXAM TYPE
+        # ==========================================
+
+        cursor.execute("""
+            SELECT id
+            FROM exam_types
+            WHERE id=?
+            AND status='Active'
+        """, (
+            exam_type_id,
+        ))
+
+        valid_exam_type = cursor.fetchone()
+
+        if not valid_exam_type:
+
+            conn.close()
+
+            flash(
+                "❌ Invalid or inactive Exam Type.",
+                "danger"
+            )
+
+            return redirect(
+                f"/edit_question_v2/{question_id}"
+            )
+
+
+        # ==========================================
+        # VERIFY SUBJECT
+        # ==========================================
+
+        cursor.execute("""
+            SELECT id
+            FROM subjects
+            WHERE id=?
+            AND exam_type_id=?
+            AND status='Active'
+        """, (
+            subject_id,
+            exam_type_id
+        ))
+
+        valid_subject = cursor.fetchone()
+
+        if not valid_subject:
+
+            conn.close()
+
+            flash(
+                "❌ Invalid Subject for the selected Exam Type.",
+                "danger"
+            )
+
+            return redirect(
+                f"/edit_question_v2/{question_id}"
+            )
+
+
+        # ==========================================
+        # VERIFY TOPIC
+        # ==========================================
+
+        cursor.execute("""
+            SELECT id
+            FROM topics
+            WHERE id=?
+            AND subject_id=?
+            AND status='Active'
+        """, (
+            topic_id,
+            subject_id
+        ))
+
+        valid_topic = cursor.fetchone()
+
+        if not valid_topic:
+
+            conn.close()
+
+            flash(
+                "❌ Invalid Topic for the selected Subject.",
+                "danger"
+            )
+
+            return redirect(
+                f"/edit_question_v2/{question_id}"
+            )
+
+
+        # ==========================================
+        # DUPLICATE PROTECTION
+        # ==========================================
+
+        cursor.execute("""
+            SELECT id
+            FROM questions_v2
+            WHERE exam_type_id=?
+            AND subject_id=?
+            AND topic_id=?
+            AND question_text=?
+            AND id != ?
+        """, (
+            exam_type_id,
+            subject_id,
+            topic_id,
+            question_text,
+            question_id
+        ))
+
+        duplicate = cursor.fetchone()
+
+        if duplicate:
+
+            conn.close()
+
+            flash(
+                "⚠️ Another question with the same "
+                "text already exists.",
+                "warning"
+            )
+
+            return redirect(
+                f"/edit_question_v2/{question_id}"
+            )
+
+
+        # ==========================================
+        # UPDATE DATABASE
+        # ==========================================
+
+        try:
+
+            cursor.execute("""
+                UPDATE questions_v2
+
+                SET
+
+                    exam_type_id=?,
+
+                    subject_id=?,
+
+                    topic_id=?,
+
+                    question_type=?,
+
+                    difficulty=?,
+
+                    question_text=?,
+
+                    option_a=?,
+
+                    option_b=?,
+
+                    option_c=?,
+
+                    option_d=?,
+
+                    correct_answer=?,
+
+                    explanation=?,
+
+                    status=?
+
+                WHERE id=?
+
+            """, (
+                exam_type_id,
+                subject_id,
+                topic_id,
+                question_type,
+                difficulty,
+                question_text,
+                option_a,
+                option_b,
+                option_c,
+                option_d,
+                correct_answer,
+                explanation,
+                status,
+                question_id
+            ))
+
+
+            conn.commit()
+            conn.close()
+
+
+            flash(
+                "✅ Question updated successfully.",
+                "success"
+            )
+
+
+            return redirect(
+                f"/view_question_v2/{question_id}"
+            )
+
+
+        except Exception as e:
+
+            conn.rollback()
+            conn.close()
+
+            print(
+                "EDIT QUESTION V2 ERROR:",
+                e
+            )
+
+            flash(
+                "❌ Failed to update question.",
+                "danger"
+            )
+
+            return redirect(
+                f"/edit_question_v2/{question_id}"
+            )
+
+
+    # ==========================================
+    # LOAD EXAM TYPES
+    # ==========================================
+
+    cursor.execute("""
+        SELECT
+            id,
+            exam_name
+        FROM exam_types
+        WHERE status='Active'
+        ORDER BY exam_name
+    """)
+
+    exam_types = cursor.fetchall()
+
+
+    # ==========================================
+    # LOAD ACTIVE SUBJECTS
+    # ==========================================
+
+    cursor.execute("""
+        SELECT
+            id,
+            subject_name,
+            exam_type_id
+        FROM subjects
+        WHERE status='Active'
+        ORDER BY subject_name
+    """)
+
+    subjects = cursor.fetchall()
+
+
+    # ==========================================
+    # LOAD ACTIVE TOPICS
+    # ==========================================
+
+    cursor.execute("""
+        SELECT
+            id,
+            topic_name,
+            subject_id
+        FROM topics
+        WHERE status='Active'
+        ORDER BY topic_name
+    """)
+
+    topics = cursor.fetchall()
+
+
+    conn.close()
+
+
+    return render_template(
+        "edit_question_v2.html",
+
+        question=question,
+
+        exam_types=exam_types,
+
+        subjects=subjects,
+
+        topics=topics
+    )
+
+
+@admin_bp.route("/toggle_question_v2/<int:question_id>", methods=["POST"])
+def toggle_question_v2(question_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # ==========================================
+    # GET CURRENT STATUS
+    # ==========================================
+
+    cursor.execute("""
+        SELECT id, status
+        FROM questions_v2
+        WHERE id=?
+    """, (question_id,))
+
+    question = cursor.fetchone()
+
+    if not question:
+
+        conn.close()
+
+        flash(
+            "❌ Question not found.",
+            "danger"
+        )
+
+        return redirect("/question_bank_v2")
+
+
+    # ==========================================
+    # DETERMINE NEW STATUS
+    # ==========================================
+
+    if question["status"] == "Active":
+
+        new_status = "Inactive"
+
+        message = "✅ Question deactivated successfully."
+
+        category = "success"
+
+    else:
+
+        new_status = "Active"
+
+        message = "✅ Question activated successfully."
+
+        category = "success"
+
+
+    # ==========================================
+    # UPDATE STATUS
+    # ==========================================
+
+    try:
+
+        cursor.execute("""
+            UPDATE questions_v2
+
+            SET status=?
+
+            WHERE id=?
+
+        """, (
+            new_status,
+            question_id
+        ))
+
+        conn.commit()
+        conn.close()
+
+
+        # ======================================
+        # FLASH MESSAGE
+        # ======================================
+
+        flash(
+            message,
+            category
+        )
+
+
+        # ======================================
+        # RETURN TO QUESTION VIEW
+        # ======================================
+
+        return redirect(
+            f"/view_question_v2/{question_id}"
+        )
+
+
+    except Exception as e:
+
+        conn.rollback()
+        conn.close()
+
+        print(
+            "TOGGLE QUESTION V2 ERROR:",
+            e
+        )
+
+        flash(
+            "❌ Failed to change question status.",
+            "danger"
+        )
+
+        return redirect(
+            f"/view_question_v2/{question_id}"
+        )
+
+
+@admin_bp.route("/bulk_question_action_v2", methods=["POST"])
+def bulk_question_action_v2():
+    # ==========================================
+    # GET SELECTED QUESTION IDS
+    # ==========================================
+
+    question_ids = request.form.getlist(
+        "question_ids"
+    )
+
+    action = request.form.get(
+        "action",
+        ""
+    ).strip()
+
+
+    # ==========================================
+    # CHECK SELECTION
+    # ==========================================
+
+    if not question_ids:
+
+        flash(
+            "⚠️ Please select at least one question.",
+            "warning"
+        )
+
+        return redirect(
+            request.referrer or
+            "/question_bank_v2"
+        )
+
+
+    # ==========================================
+    # VALIDATE ACTION
+    # ==========================================
+
+    if action not in [
+        "activate",
+        "deactivate",
+        "delete"
+    ]:
+
+        flash(
+            "❌ Invalid bulk action.",
+            "danger"
+        )
+
+        return redirect(
+            request.referrer or
+            "/question_bank_v2"
+        )
+
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+
+    try:
+
+        # ==========================================
+        # CLEAN QUESTION IDS
+        # ==========================================
+
+        valid_ids = []
+
+        for question_id in question_ids:
+
+            try:
+
+                question_id = int(
+                    question_id
+                )
+
+                valid_ids.append(
+                    question_id
+                )
+
+            except ValueError:
+
+                continue
+
+
+        if not valid_ids:
+
+            conn.close()
+
+            flash(
+                "⚠️ No valid questions were selected.",
+                "warning"
+            )
+
+            return redirect(
+                request.referrer or
+                "/question_bank_v2"
+            )
+
+
+        # ==========================================
+        # CREATE SQL PLACEHOLDERS
+        # ==========================================
+
+        placeholders = ",".join(
+            ["?"] * len(valid_ids)
+        )
+
+
+        # ==========================================
+        # ACTIVATE
+        # ==========================================
+
+        if action == "activate":
+
+            cursor.execute(
+                f"""
+                UPDATE questions_v2
+
+                SET status='Active'
+
+                WHERE id IN ({placeholders})
+                """,
+                valid_ids
+            )
+
+            affected_count = cursor.rowcount
+
+            conn.commit()
+            conn.close()
+
+            flash(
+                f"🟢 {affected_count} question(s) activated successfully.",
+                "success"
+            )
+
+            return redirect(
+                request.referrer or
+                "/question_bank_v2"
+            )
+
+
+        # ==========================================
+        # DEACTIVATE
+        # ==========================================
+
+        elif action == "deactivate":
+
+            cursor.execute(
+                f"""
+                UPDATE questions_v2
+
+                SET status='Inactive'
+
+                WHERE id IN ({placeholders})
+                """,
+                valid_ids
+            )
+
+            affected_count = cursor.rowcount
+
+            conn.commit()
+            conn.close()
+
+            flash(
+                f"🔴 {affected_count} question(s) deactivated successfully.",
+                "success"
+            )
+
+            return redirect(
+                request.referrer or
+                "/question_bank_v2"
+            )
+
+
+        # ==========================================
+        # DELETE
+        # ==========================================
+
+        elif action == "delete":
+
+            cursor.execute(
+                f"""
+                DELETE FROM questions_v2
+
+                WHERE id IN ({placeholders})
+                """,
+                valid_ids
+            )
+
+            affected_count = cursor.rowcount
+
+            conn.commit()
+            conn.close()
+
+            flash(
+                f"🗑️ {affected_count} question(s) deleted successfully.",
+                "success"
+            )
+
+            return redirect(
+                request.referrer or
+                "/question_bank_v2"
+            )
+
+
+    except Exception as e:
+
+        conn.rollback()
+        conn.close()
+
+        print(
+            "BULK QUESTION ACTION V2 ERROR:",
+            e
+        )
+
+        flash(
+            "❌ Failed to complete the bulk action.",
+            "danger"
+        )
+
+        return redirect(
+            request.referrer or
+            "/question_bank_v2"
+        )
+
+
+@admin_bp.route("/delete_question_v2/<int:question_id>", methods=["POST"])
+def delete_question_v2(question_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    # ==========================================
+    # CHECK QUESTION EXISTS
+    # ==========================================
+
+    cursor.execute("""
+        SELECT id
+        FROM questions_v2
+        WHERE id=?
+    """, (question_id,))
+
+    question = cursor.fetchone()
+
+    if not question:
+
+        conn.close()
+
+        flash(
+            "❌ Question not found.",
+            "danger"
+        )
+
+        return redirect("/question_bank_v2")
+
+
+    # ==========================================
+    # DELETE QUESTION
+    # ==========================================
+
+    try:
+
+        cursor.execute("""
+            DELETE FROM questions_v2
+            WHERE id=?
+        """, (question_id,))
+
+        conn.commit()
+        conn.close()
+
+
+        # ======================================
+        # SUCCESS MESSAGE
+        # ======================================
+
+        flash(
+            "✅ Question deleted successfully.",
+            "success"
+        )
+
+
+        return redirect("/question_bank_v2")
+
+
+    except Exception as e:
+
+        conn.rollback()
+        conn.close()
+
+        print(
+            "DELETE QUESTION V2 ERROR:",
+            e
+        )
+
+        flash(
+            "❌ Failed to delete question.",
+            "danger"
+        )
+
+        return redirect(
+            f"/view_question_v2/{question_id}"
+        )
+
+
+@admin_bp.route("/import_questions_v2", methods=["GET", "POST"])
+def import_questions_v2():
+    if request.method == "POST":
+
+        # ==========================================
+        # CHECK FILE
+        # ==========================================
+
+        if "excel_file" not in request.files:
+
+            flash(
+                "❌ No Excel file was selected.",
+                "danger"
+            )
+
+            return redirect("/import_questions_v2")
+
+        file = request.files["excel_file"]
+
+        if file.filename == "":
+
+            flash(
+                "❌ No Excel file was selected.",
+                "danger"
+            )
+
+            return redirect("/import_questions_v2")
+
+        # ==========================================
+        # CHECK FILE TYPE
+        # ==========================================
+
+        if not file.filename.lower().endswith(".xlsx"):
+
+            flash(
+                "❌ Only .xlsx Excel files are supported.",
+                "danger"
+            )
+
+            return redirect("/import_questions_v2")
+
+        # ==========================================
+        # OPEN EXCEL FILE
+        # ==========================================
+
+        try:
+
+            workbook = load_workbook(
+                file,
+                read_only=True,
+                data_only=True
+            )
+
+            worksheet = workbook.active
+
+        except Exception as e:
+
+            flash(
+                "❌ Unable to read the Excel file.",
+                "danger"
+            )
+
+            return redirect("/import_questions_v2")
+
+        # ==========================================
+        # DATABASE
+        # ==========================================
+
+        conn = sqlite3.connect(DB_PATH, timeout=15)
+        cursor = conn.cursor()
+
+        # ==========================================
+        # COUNTERS
+        # ==========================================
+
+        imported = 0
+        duplicates = 0
+        errors = 0
+
+        error_messages = []
+        created_topics = set()
+
+        # ==========================================
+        # READ HEADER
+        # ==========================================
+
+        rows = worksheet.iter_rows(
+            values_only=True
+        )
+
+        try:
+
+            header = next(rows)
+
+        except StopIteration:
+
+            workbook.close()
+            conn.close()
+
+            flash(
+                "❌ The Excel file is empty.",
+                "danger"
+            )
+
+            return redirect("/import_questions_v2")
+
+        # ==========================================
+        # NORMALIZE HEADERS
+        # ==========================================
+
+        headers = []
+
+        for value in header:
+
+            if value is None:
+
+                headers.append("")
+
+            else:
+
+                headers.append(
+                    str(value)
+                    .strip()
+                    .lower()
+                )
+
+        # ==========================================
+        # REQUIRED COLUMNS
+        # ==========================================
+
+        required_columns = [
+
+            "exam type",
+            "subject",
+            "topic",
+            "question",
+            "option a",
+            "option b",
+            "option c",
+            "option d",
+            "answer",
+            "explanation",
+            "difficulty"
+
+        ]
+
+        # ==========================================
+        # CHECK REQUIRED COLUMNS
+        # ==========================================
+
+        missing_columns = []
+
+        for column in required_columns:
+
+            if column not in headers:
+
+                missing_columns.append(column)
+
+        if missing_columns:
+
+            workbook.close()
+            conn.close()
+
+            flash(
+                "❌ Missing Excel columns: "
+                + ", ".join(missing_columns),
+                "danger"
+            )
+
+            return redirect("/import_questions_v2")
+
+        # ==========================================
+        # COLUMN INDEXES
+        # ==========================================
+
+        exam_type_index = headers.index(
+            "exam type"
+        )
+
+        subject_index = headers.index(
+            "subject"
+        )
+
+        topic_index = headers.index(
+            "topic"
+        )
+
+        question_index = headers.index(
+            "question"
+        )
+
+        option_a_index = headers.index(
+            "option a"
+        )
+
+        option_b_index = headers.index(
+            "option b"
+        )
+
+        option_c_index = headers.index(
+            "option c"
+        )
+
+        option_d_index = headers.index(
+            "option d"
+        )
+
+        answer_index = headers.index(
+            "answer"
+        )
+
+        explanation_index = headers.index(
+            "explanation"
+        )
+
+        difficulty_index = headers.index(
+            "difficulty"
+        )
+
+        # ==========================================
+        # PROCESS EACH ROW
+        # ==========================================
+
+        for row_number, row in enumerate(
+            rows,
+            start=2
+        ):
+
+            try:
+
+                # ----------------------------------
+                # SAFELY GET CELL VALUES
+                # ----------------------------------
+
+                def get_value(index):
+
+                    if index >= len(row):
+
+                        return ""
+
+                    value = row[index]
+
+                    if value is None:
+
+                        return ""
+
+                    return str(value).strip()
+
+                exam_type_name = get_value(
+                    exam_type_index
+                )
+
+                subject_name = get_value(
+                    subject_index
+                )
+
+                topic_name = get_value(
+                    topic_index
+                )
+
+                question_text = get_value(
+                    question_index
+                )
+
+                option_a = get_value(
+                    option_a_index
+                )
+
+                option_b = get_value(
+                    option_b_index
+                )
+
+                option_c = get_value(
+                    option_c_index
+                )
+
+                option_d = get_value(
+                    option_d_index
+                )
+
+                correct_answer = get_value(
+                    answer_index
+                ).upper()
+
+                explanation = get_value(
+                    explanation_index
+                )
+
+                difficulty = get_value(
+                    difficulty_index
+                )
+
+                # ----------------------------------
+                # SKIP COMPLETELY EMPTY ROW
+                # ----------------------------------
+
+                if not any(row):
+
+                    continue
+
+                # ----------------------------------
+                # REQUIRED DATA
+                # ----------------------------------
+
+                if not exam_type_name:
+
+                    raise ValueError(
+                        "Exam Type is empty."
+                    )
+
+                if not subject_name:
+
+                    raise ValueError(
+                        "Subject is empty."
+                    )
+
+                if not topic_name:
+
+                    raise ValueError(
+                        "Topic is empty."
+                    )
+
+                if not question_text:
+
+                    raise ValueError(
+                        "Question is empty."
+                    )
+
+                if not correct_answer:
+
+                    raise ValueError(
+                        "Answer is empty."
+                    )
+
+                # ----------------------------------
+                # VALIDATE ANSWER
+                # ----------------------------------
+
+                if correct_answer not in [
+                    "A",
+                    "B",
+                    "C",
+                    "D"
+                ]:
+
+                    raise ValueError(
+                        "Answer must be A, B, C or D."
+                    )
+
+                # ----------------------------------
+                # FIND EXAM TYPE
+                # ----------------------------------
+
+                cursor.execute("""
+                    SELECT id
+                    FROM exam_types
+                    WHERE LOWER(exam_name)=LOWER(?)
+                    AND status='Active'
+                """, (
+                    exam_type_name,
+                ))
+
+                exam_type = cursor.fetchone()
+
+                if not exam_type:
+
+                    raise ValueError(
+                        f"Exam Type '{exam_type_name}' "
+                        f"was not found or is inactive."
+                    )
+
+                exam_type_id = exam_type[0]
+
+                # ----------------------------------
+                # FIND SUBJECT
+                # ----------------------------------
+
+                cursor.execute("""
+                    SELECT id
+                    FROM subjects
+                    WHERE LOWER(subject_name)=LOWER(?)
+                    AND exam_type_id=?
+                    AND status='Active'
+                """, (
+                    subject_name,
+                    exam_type_id
+                ))
+
+                subject = cursor.fetchone()
+
+                if not subject:
+
+                    raise ValueError(
+                        f"Subject '{subject_name}' "
+                        f"does not belong to "
+                        f"'{exam_type_name}' "
+                        f"or is inactive."
+                    )
+
+                subject_id = subject[0]
+
+                # ----------------------------------
+                # FIND TOPIC
+                # ----------------------------------
+
+                cursor.execute("""
+                    SELECT id
+                    FROM topics
+                    WHERE LOWER(topic_name)=LOWER(?)
+                    AND subject_id=?
+                    AND status='Active'
+                """, (
+                    topic_name,
+                    subject_id
+                ))
+
+                topic = cursor.fetchone()
+
+                if not topic:
+                    # New topic name -> create it under this subject so bulk uploads
+                    # never fail just because a topic label is new.
+                    cursor.execute(
+                        "INSERT INTO topics (subject_id, topic_name, status) VALUES (?, ?, 'Active')",
+                        (subject_id, topic_name.strip()[:120]),
+                    )
+                    topic = (cursor.lastrowid,)
+                    created_topics.add(f"{subject_name} › {topic_name.strip()}")
+
+                topic_id = topic[0]
+
+                # ----------------------------------
+                # CHECK DUPLICATE
+                # ----------------------------------
+
+                cursor.execute("""
+                    SELECT id
+                    FROM questions_v2
+                    WHERE subject_id=?
+                    AND topic_id=?
+                    AND question_text=?
+                """, (
+                    subject_id,
+                    topic_id,
+                    question_text
+                ))
+
+                existing_question = cursor.fetchone()
+
+                if existing_question:
+
+                    duplicates += 1
+
+                    error_messages.append(
+                        f"Row {row_number}: "
+                        f"Duplicate question skipped."
+                    )
+
+                    continue
+
+                # ----------------------------------
+                # NORMALIZE DIFFICULTY
+                # ----------------------------------
+
+                difficulty_map = {
+
+                    "easy": "Easy",
+
+                    "medium": "Medium",
+
+                    "hard": "Hard"
+
+                }
+
+                difficulty_value = difficulty_map.get(
+                    difficulty.lower(),
+                    "Medium"
+                )
+
+                # ----------------------------------
+                # INSERT QUESTION
+                # ----------------------------------
+
+                cursor.execute("""
+                    INSERT INTO questions_v2
+                    (
+                        exam_type_id,
+                        subject_id,
+                        topic_id,
+                        question_type,
+                        difficulty,
+                        question_text,
+                        option_a,
+                        option_b,
+                        option_c,
+                        option_d,
+                        correct_answer,
+                        explanation,
+                        status,
+                        tier
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """, (
+                    exam_type_id,
+                    subject_id,
+                    topic_id,
+                    "Objective",
+                    difficulty_value,
+                    question_text,
+                    option_a,
+                    option_b,
+                    option_c,
+                    option_d,
+                    correct_answer,
+                    explanation,
+                    "Active"
+                ))
+
+                imported += 1
+
+            except Exception as e:
+
+                errors += 1
+
+                error_messages.append(
+                    f"Row {row_number}: {str(e)}"
+                )
+
+        # ==========================================
+        # SAVE IMPORTED QUESTIONS
+        # ==========================================
+
+        conn.commit()
+
+        # ==========================================
+        # PREPARE IMPORT DETAILS
+        # ==========================================
+
+        import_details = "\n".join(
+            error_messages
+        )
+
+        # ==========================================
+        # SAVE IMPORT HISTORY
+        # ==========================================
+
+        cursor.execute("""
+            INSERT INTO question_import_logs
+            (
+                filename,
+                imported_count,
+                skipped_count,
+                error_count,
+                uploaded_by,
+                details
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            file.filename,
+            imported,
+            duplicates,
+            errors,
+            session.get("user", "Admin"),
+            import_details
+        ))
+
+        # ==========================================
+        # IMPORTANT:
+        # COMMIT IMPORT HISTORY
+        # ==========================================
+
+        conn.commit()
+
+        # ==========================================
+        # CLOSE RESOURCES
+        # ==========================================
+
+        workbook.close()
+        conn.close()
+
+        # ==========================================
+        # STORE IMPORT RESULTS
+        # ==========================================
+
+        session["import_results"] = {
+
+            "imported": imported,
+
+            "duplicates": duplicates,
+
+            "errors": errors,
+
+            "error_messages": error_messages[:50],
+
+            "created_topics": sorted(created_topics)[:60],
+
+        }
+
+        return redirect(
+            "/import_questions_v2"
+        )
+
+    # ==========================================
+    # DISPLAY IMPORT RESULTS
+    # ==========================================
+
+    import_results = session.pop(
+        "import_results",
+        None
+    )
+
+    return render_template(
+        "import_questions_v2.html",
+        import_results=import_results
+    )
+
+
+@admin_bp.route("/download_question_template")
+def download_question_template():
+    """Excel template for bulk upload. Sheet 1 = rows to fill, sheet 2 = live subjects + topics + current
+    counts (the brief for question writers), sheet 3 = rules. Generated in memory."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    headers = ["Exam Type", "Subject", "Topic", "Question", "Option A", "Option B", "Option C", "Option D",
+               "Answer", "Explanation", "Difficulty"]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Questions"
+    ws.append(headers)
+    ws.append(["JAMB", "Mathematics", "Sets", "Which of the following is a subset of {1, 2, 3}?", "{1, 2}", "{4, 5}",
+               "{2, 4}", "{5, 6}", "A", "Both 1 and 2 are elements of the original set, so {1, 2} is a subset.", "Easy"])
+    ws.append(["JAMB", "Use of English", "Lexis and Structure", "Choose the option nearest in meaning to the underlined word: The chairman was ADAMANT about the decision.",
+               "flexible", "unyielding", "confused", "cheerful", "B", "Adamant means refusing to change one's mind; unyielding is the closest in meaning.", "Medium"])
+    head_fill = PatternFill("solid", fgColor="0B7A4B")
+    for c in ws[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = head_fill
+        c.alignment = Alignment(vertical="center")
+    for col, width in zip("ABCDEFGHIJK", (11, 26, 26, 60, 22, 22, 22, 22, 9, 60, 11)):
+        ws.column_dimensions[col].width = width
+    ws.freeze_panes = "A2"
+
+    # Sheet 2: subjects, topics and current bank sizes
+    conn = connect()
+    ws2 = wb.create_sheet("Subjects & Topics")
+    ws2.append(["Exam Type", "Subject", "Questions in bank now", "Topic", "Questions in topic"])
+    for c in ws2[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = head_fill
+    rows = conn.execute(
+        """
+        SELECT e.exam_name, s.subject_name, t.topic_name,
+               (SELECT COUNT(*) FROM questions_v2 q WHERE q.subject_id = s.id AND q.status = 'Active') AS subj_n,
+               (SELECT COUNT(*) FROM questions_v2 q WHERE q.topic_id = t.id AND q.status = 'Active') AS topic_n
+        FROM subjects s
+        JOIN exam_types e ON e.id = s.exam_type_id
+        LEFT JOIN topics t ON t.subject_id = s.id AND t.status = 'Active'
+        WHERE s.status = 'Active' AND e.status = 'Active'
+        ORDER BY e.exam_name, subj_n DESC, s.subject_name, t.topic_name
+        """
+    ).fetchall()
+    conn.close()
+    for r in rows:
+        ws2.append([r["exam_name"], r["subject_name"], r["subj_n"], r["topic_name"] or "(no topics yet — add your own)", r["topic_n"] if r["topic_name"] else ""])
+    for col, width in zip("ABCDE", (11, 28, 20, 42, 18)):
+        ws2.column_dimensions[col].width = width
+    ws2.freeze_panes = "A2"
+
+    # Sheet 3: rules for writers
+    ws3 = wb.create_sheet("Instructions")
+    tips = [
+        "HOW TO FILL THE 'Questions' SHEET",
+        "",
+        "1. Exam Type: JAMB (WAEC / POST-UTME when those banks open). Must match the 'Subjects & Topics' sheet.",
+        "2. Subject: copy the exact spelling from the 'Subjects & Topics' sheet (e.g. 'Use of English', not 'English').",
+        "3. Topic: use an existing topic where one fits; a new topic name is accepted and created automatically.",
+        "4. Question: the full question text. For comprehension, put the passage inside the question text.",
+        "5. Options A-D: four distinct options. Do not prefix them with 'A.' or 'a)'.",
+        "6. Answer: a single letter A, B, C or D.",
+        "7. Explanation: 1-3 sentences that teach WHY the answer is right (students see this after the exam).",
+        "8. Difficulty: Easy, Medium or Hard. Aim for roughly 40% Easy, 40% Medium, 20% Hard.",
+        "",
+        "QUALITY RULES",
+        "- No duplicate questions: identical question text in the same subject is skipped on import.",
+        "- Check every answer letter twice. A wrong key is the fastest way to lose a student's trust.",
+        "- Avoid 'All of the above' / 'None of the above' unless it is a genuine past question.",
+        "- Keep the mix of correct letters balanced (not always B).",
+        "",
+        "UPLOAD: Admin > Import > choose this file. Up to a few thousand rows per file is fine.",
+        "Questions go live in mock exams and practice mode immediately after import.",
+    ]
+    for t in tips:
+        ws3.append([t])
+    ws3.column_dimensions["A"].width = 110
+    ws3["A1"].font = Font(bold=True, size=12)
+    ws3["A12"].font = Font(bold=True)
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name="prepnova_question_template.xlsx",
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+@admin_bp.route("/question_import_history")
+def question_import_history():
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            id,
+            filename,
+            imported_count,
+            skipped_count,
+            error_count,
+            uploaded_by,
+            uploaded_at
+        FROM question_import_logs
+        ORDER BY id DESC
+    """)
+
+    import_logs = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "question_import_history.html",
+        import_logs=import_logs
+    )
+
+
+@admin_bp.route("/question_import_details/<int:log_id>")
+def question_import_details(log_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            id,
+            filename,
+            imported_count,
+            skipped_count,
+            error_count,
+            uploaded_by,
+            uploaded_at,
+            details
+        FROM question_import_logs
+        WHERE id=?
+    """, (log_id,))
+
+    import_log = cursor.fetchone()
+
+    conn.close()
+
+    if not import_log:
+
+        flash(
+            "❌ Import record not found.",
+            "danger"
+        )
+
+        return redirect(
+            "/question_import_history"
+        )
+
+    return render_template(
+        "question_import_details.html",
+        import_log=import_log
+    )
+
+
+@admin_bp.route("/get_subjects/<int:exam_type_id>")
+def get_subjects(exam_type_id):
+
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            id,
+            subject_name
+        FROM subjects
+        WHERE
+            exam_type_id=?
+            AND status='Active'
+        ORDER BY subject_name
+    """, (exam_type_id,))
+
+    subjects = cursor.fetchall()
+
+    conn.close()
+
+    return {
+        "subjects": [
+            dict(subject)
+            for subject in subjects
+        ]
+    }
+
+
+@admin_bp.route("/get_topics/<int:subject_id>")
+def get_topics(subject_id):
+
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            id,
+            topic_name
+        FROM topics
+        WHERE
+            subject_id=?
+            AND status='Active'
+        ORDER BY topic_name
+    """, (subject_id,))
+
+    topics = cursor.fetchall()
+
+    conn.close()
+
+    return {
+        "topics": [
+            dict(topic)
+            for topic in topics
+        ]
+    }
+
+
+@admin_bp.route("/download_template")
+def download_template():
+    """Legacy template link — the v2 template is the single source of truth for import columns."""
+    return redirect(url_for("admin_bp.download_question_template"))
+
+@admin_bp.route("/manage_questions")
+def manage_questions():
+    search = request.args.get("search", "").strip()
+
+    exam_filter = request.args.get("exam_type", "").strip()
+
+    subject_filter = request.args.get("subject", "").strip()
+
+    page = request.args.get("page", 1, type=int)
+
+    per_page = 20
+
+    offset = (page - 1) * per_page
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    conditions = []
+    params = []
+
+    if search:
+        conditions.append(
+            "(exam_type LIKE ? OR subject LIKE ? OR question_text LIKE ?)"
+        )
+
+        params.extend([
+            f"%{search}%",
+            f"%{search}%",
+            f"%{search}%"
+        ])
+
+    if exam_filter:
+        conditions.append("exam_type = ?")
+        params.append(exam_filter)
+
+    if subject_filter:
+        conditions.append("subject = ?")
+        params.append(subject_filter)
+
+    where_clause = ""
+
+    if conditions:
+        where_clause = "WHERE " + " AND ".join(conditions)
+
+    # Count total records
+    count_query = f"""
+        SELECT COUNT(*)
+        FROM questions
+        {where_clause}
+    """
+
+    cursor.execute(count_query, params)
+
+    total_questions = cursor.fetchone()[0]
+
+    # Get paginated records
+    query = f"""
+        SELECT *
+        FROM questions
+        {where_clause}
+        ORDER BY id DESC
+        LIMIT ?
+        OFFSET ?
+    """
+
+    cursor.execute(
+        query,
+        params + [per_page, offset]
+    )
+
+    questions = cursor.fetchall()
+
+    conn.close()
+
+    total_pages = (
+        total_questions + per_page - 1
+    ) // per_page
+
+    return render_template(
+        "manage_questions.html",
+        questions=questions,
+        search=search,
+        exam_filter=exam_filter,
+        subject_filter=subject_filter,
+        page=page,
+        total_pages=total_pages
+    )
+
+
+@admin_bp.route("/edit_question/<int:question_id>", methods=["GET", "POST"])
+def edit_question(question_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    # Save updates
+    if request.method == "POST":
+
+        exam_type = request.form["exam_type"]
+        subject = request.form["subject"]
+        question_text = request.form["question"]
+        option_a = request.form["option_a"]
+        option_b = request.form["option_b"]
+        option_c = request.form["option_c"]
+        option_d = request.form["option_d"]
+        correct_answer = request.form["correct_answer"]
+        explanation = request.form["explanation"]
+
+        cursor.execute(
+            """
+            UPDATE questions
+            SET
+                exam_type=?,
+                subject=?,
+                question_text=?,
+                option_a=?,
+                option_b=?,
+                option_c=?,
+                option_d=?,
+                correct_answer=?,
+                explanation=?
+            WHERE id=?
+            """,
+            (
+                exam_type,
+                subject,
+                question_text,
+                option_a,
+                option_b,
+                option_c,
+                option_d,
+                correct_answer,
+                explanation,
+                question_id
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+        return redirect("/manage_questions")
+
+    # Load question details
+    cursor.execute(
+        """
+        SELECT *
+        FROM questions
+        WHERE id=?
+        """,
+        (question_id,)
+    )
+
+    question = cursor.fetchone()
+
+    conn.close()
+
+    if not question:
+        abort(404)
+
+    return render_template(
+        "edit_question.html",
+        question=question
+    )
+
+
+@admin_bp.route("/delete_question/<int:question_id>", methods=["GET", "POST"])
+def delete_question(question_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    # Get question details
+    cursor.execute(
+        """
+        SELECT *
+        FROM questions
+        WHERE id=?
+        """,
+        (question_id,)
+    )
+
+    question = cursor.fetchone()
+
+    if not question:
+        conn.close()
+        abort(404)
+
+    # Delete after confirmation
+    if request.method == "POST":
+
+        cursor.execute(
+            """
+            DELETE FROM questions
+            WHERE id=?
+            """,
+            (question_id,)
+        )
+
+        conn.commit()
+        conn.close()
+
+        return redirect("/manage_questions")
+
+    conn.close()
+
+    return render_template(
+        "delete_question.html",
+        question=question
+    )
+
+
+@admin_bp.route("/admin_backup")
+def admin_backup():
+    """Download a consistent copy of the whole live database (users, results, payments, questions)."""
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    try:
+        src = connect()
+        dst = sqlite3.connect(tmp.name)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        with open(tmp.name, "rb") as fh:
+            buf = BytesIO(fh.read())
+    finally:
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+    buf.seek(0)
+    _audit("backup_download")
+    return send_file(buf, as_attachment=True, mimetype="application/octet-stream",
+                     download_name=f"prepnova-backup-{datetime.now():%Y%m%d-%H%M}.db")
+
+
+@admin_bp.route("/export_questions")
+def export_questions():
+    """Excel export of the legacy question table (kept for old data); the v2 bank has its own export."""
+    from openpyxl import Workbook
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    rows = conn.execute(
+        """
+        SELECT exam_type, subject, question_text, option_a, option_b, option_c, option_d,
+               correct_answer, explanation
+        FROM questions
+        ORDER BY id DESC
+        """
+    ).fetchall()
+    conn.close()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Questions"
+    ws.append(["exam_type", "subject", "question_text", "option_a", "option_b", "option_c", "option_d",
+               "correct_answer", "explanation"])
+    for r in rows:
+        ws.append(list(r))
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    return send_file(
+        buf,
+        as_attachment=True,
+        download_name=f"prepnova_questions_{datetime.now():%Y%m%d}.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@admin_bp.route("/download_result/<int:result_id>")
+def download_result(result_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    # Get result details
+    cursor.execute(
+        """
+        SELECT
+            r.exam_type,
+            r.exam_name,
+            r.score,
+            r.total,
+            r.percentage,
+            r.date_taken,
+            r.duration,
+            r.status,
+            r.verification_code,
+            u.name,
+            u.email,
+            u.phone
+        FROM results r
+        JOIN users u
+            ON r.username = u.email
+        WHERE r.id = ?
+        """,
+        (
+            (result_id,)
+        )
+    )
+
+    result = cursor.fetchone()
+
+    conn.close()
+
+    if not result:
+        abort(404)
+
+    (
+        exam_type,
+        exam_name,
+        score,
+        total,
+        percentage,
+        date_taken,
+        duration,
+        status,
+        verification_code,
+        student_name,
+        student_email,
+        student_phone
+    ) = result
+    
+    # Generate QR only if verification code exists
+
+    qr_buffer = None
+
+    if verification_code:
+
+        verification_url = (
+            request.host_url.rstrip("/")
+            + "/verify_result/"
+            + str(verification_code)
+        )
+
+        qr = qrcode.make(verification_url)
+
+        qr_buffer = BytesIO()
+
+        qr.save(qr_buffer, format="PNG")
+
+        qr_buffer.seek(0)
+
+    # Format duration
+    if duration is None:
+        duration_text = "-"
+
+    elif duration < 60:
+        duration_text = f"{duration} sec"
+
+    elif duration < 3600:
+        minutes = duration // 60
+        seconds = duration % 60
+        duration_text = f"{minutes} min {seconds} sec"
+
+    else:
+        hours = duration // 3600
+        minutes = (duration % 3600) // 60
+        duration_text = f"{hours} hr {minutes} min"
+
+    # Create PDF in memory
+    buffer = BytesIO()
+
+    doc = SimpleDocTemplate(buffer)
+
+    styles = getSampleStyleSheet()
+
+    elements = []
+
+    # System Name
+    elements.append(
+        Paragraph(
+            "<font color='blue'><b>NIGERIA CBT EXAMINATION SYSTEM</b></font>",
+            styles["Title"]
+        )
+    )
+
+    elements.append(
+        Paragraph(
+            "Official Student Result Slip",
+            styles["Heading2"]
+        )
+    )
+
+    elements.append(Spacer(1, 20))
+
+    student_data = [
+
+    ["Student Name", student_name],
+    ["Email", student_email],
+    ["Phone", student_phone or "-"]
+
+    ]
+
+    student_table = Table(
+        student_data,
+        colWidths=[2.2*inch, 4*inch]
+    )
+
+    student_table.setStyle(TableStyle([
+
+        ('BACKGROUND', (0,0), (0,-1), colors.lightblue),
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
+        ('FONTNAME', (0,0), (0,-1), 'Helvetica-Bold'),
+        ('PADDING', (0,0), (-1,-1), 8)
+
+    ]))
+
+    elements.append(student_table)
+
+    elements.append(Spacer(1, 20))
+
+    elements.append(Spacer(1, 15))
+
+    exam_data = [
+
+    ["Exam Type", exam_type],
+    ["Subject/Course", exam_name],
+    ["Score", f"{score}/{total}"],
+    ["Percentage", f"{percentage}%"],
+    ["Status", status],
+    ["Time Spent", duration_text],
+    ["Date Taken", date_taken],
+    ["Verification Code", verification_code]
+
+    ]
+
+    exam_table = Table(
+        exam_data,
+        colWidths=[2.2*inch, 4*inch]
+    )
+
+    exam_table.setStyle(TableStyle([
+
+        ('BACKGROUND', (0,0), (0,-1), colors.beige),
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
+        ('FONTNAME', (0,0), (0,-1), 'Helvetica-Bold'),
+        ('PADDING', (0,0), (-1,-1), 8)
+
+    ]))
+
+    elements.append(exam_table)
+    
+    elements.append(Spacer(1, 20))
+
+    if qr_buffer:
+
+        elements.append(
+            Paragraph(
+                "<b>Scan QR Code to Verify Result</b>",
+                styles["Heading3"]
+            )
+        )
+
+        qr_image = Image(qr_buffer)
+
+        qr_image.drawWidth = 1.5 * inch
+        qr_image.drawHeight = 1.5 * inch
+
+        elements.append(qr_image)
+
+    elements.append(Spacer(1, 25))
+
+    elements.append(Spacer(1, 30))
+
+    elements.append(
+        Paragraph(
+            "<i>This is an electronically generated result slip.</i>",
+            styles["Italic"]
+        )
+    )
+
+    elements.append(
+        Paragraph(
+            "<i>No signature is required.</i>",
+            styles["Italic"]
+        )
+    )
+
+    doc.build(elements)
+
+    buffer.seek(0)
+
+    filename = (
+        f"{exam_type}_{exam_name}_Result.pdf"
+    )
+
+    return send_file(
+        buffer,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/pdf"
+    )
+
+
+@admin_bp.route("/admin/review_answers/<int:result_id>")
+def admin_review_answers(result_id):
+    """Admin view of a student's corrections (same renderer as the student page)."""
+    import exam_engine as engine
+    r, items = engine.load_review(result_id)  # no username filter: admins may view any result
+    if not r:
+        abort(404)
+    show = request.args.get("show", "all")
+    if show == "wrong":
+        items = [i for i in items if not i["is_correct"]]
+    subjects = sorted({i["subject"] for i in items})
+    return render_template("review_answers.html", r=r, items=items, show=show, subjects=subjects, admin_view=True)
+
+
+@admin_bp.route("/upload_questions", methods=["GET", "POST"])
+def upload_questions():
+    """Legacy uploader — superseded by the v2 importer (matching template, duplicate detection, import history)."""
+    return redirect(url_for("admin_bp.import_questions_v2"))
+
+
+@admin_bp.route("/add_post_utme_question", methods=["GET", "POST"])
+def add_post_utme_question():
+
+    if request.method == "POST":
+
+        university = request.form["university"]
+        subject = request.form["subject"]
+
+        question = request.form["question"]
+
+        option_a = request.form["option_a"]
+        option_b = request.form["option_b"]
+        option_c = request.form["option_c"]
+        option_d = request.form["option_d"]
+
+        correct_answer = request.form["correct_answer"]
+
+        conn = sqlite3.connect(DB_PATH, timeout=15)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO post_utme_questions (
+                university_name,
+                subject,
+                question,
+                option_a,
+                option_b,
+                option_c,
+                option_d,
+                correct_answer
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                university,
+                subject,
+                question,
+                option_a,
+                option_b,
+                option_c,
+                option_d,
+                correct_answer
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+        flash("Post-UTME question saved.", "success")
+        return redirect(url_for("admin_bp.add_post_utme_question"))
+
+    # Load universities for dropdown
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT university_name
+        FROM post_utme_universities
+        ORDER BY university_name
+        """
+    )
+
+    universities = cursor.fetchall()
+
+    conn.close()
+
+    return render_template(
+        "add_post_utme_question.html",
+        universities=universities
+    )
+
+
+@admin_bp.route("/get_post_utme_subjects")
+def get_post_utme_subjects():
+
+    """Subjects a school-specific upload can be filed under: every UTME subject plus Current Affairs."""
+    import post_utme as putme
+    return {"subjects": [putme.ENGLISH] + list(putme.JAMB_ELECTIVES) + [putme.CA_SUBJECT]}
+
+
+# ---------------------------------------------------------------------------
+# Schools & lesson centres
+# ---------------------------------------------------------------------------
+
+@admin_bp.route("/centres")
+def manage_centres():
+    conn = connect()
+    cur = conn.cursor()
+    centres = cur.execute(
+        """SELECT c.*,
+                  (SELECT COUNT(*) FROM centre_members m WHERE m.centre_id = c.id) AS members,
+                  (SELECT SUM(amount) FROM centre_orders o WHERE o.centre_id = c.id AND o.status = 'PAID') AS revenue
+             FROM centres c ORDER BY c.id DESC LIMIT 300""").fetchall()
+    stats = {
+        "centres": len(centres),
+        "seats": sum(c["seats"] or 0 for c in centres),
+        "members": sum(c["members"] or 0 for c in centres),
+        "revenue": sum(c["revenue"] or 0 for c in centres),
+    }
+    conn.close()
+    return render_template("manage_centres.html", centres=centres, stats=stats,
+                           durations=DURATIONS, fmt_naira=fmt_naira,
+                           today=datetime.now().strftime("%Y-%m-%d"))
+
+
+@admin_bp.route("/centres/create", methods=["POST"])
+def create_centre():
+    """Manual creation for bank-transfer / cash sales. Activates immediately."""
+    centre_name = (request.form.get("centre_name") or "").strip()[:60]
+    owner_email = (request.form.get("owner_email") or "").strip().lower()[:120]
+    owner_name = (request.form.get("owner_name") or "").strip()[:60]
+    owner_phone = (request.form.get("owner_phone") or "").strip()[:20]
+    try:
+        seats = int(request.form.get("seats") or 0)
+        days = int(request.form.get("days") or 0)
+    except ValueError:
+        seats = days = 0
+    amount_raw = (request.form.get("amount") or "").strip()
+    if len(centre_name) < 3 or "@" not in owner_email or seats < 1 or seats > 500 or days not in DURATION_LABEL:
+        flash("Check the form — name, a valid owner email, seats (1-500) and a plan length are required.", "warning")
+        return redirect(url_for("admin_bp.manage_centres"))
+    try:
+        amount = round(float(amount_raw), 2) if amount_raw else order_total(seats, days)
+    except ValueError:
+        amount = order_total(seats, days)
+    conn = connect()
+    cur = conn.cursor()
+    reference = f"MANUAL-C-{secrets.token_hex(4).upper()}"
+    cur.execute(
+        "INSERT INTO centre_orders (reference, centre_name, owner_username, owner_name, owner_phone, seats, days, amount, status, created_at, paid_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PAID', ?, ?)",
+        (reference, centre_name, owner_email, owner_name, owner_phone, seats, days, amount,
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S"), datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    order = cur.execute("SELECT * FROM centre_orders WHERE reference = ?", (reference,)).fetchone()
+    centre, join_code = activate_centre_order(cur, order)
+    conn.commit()
+    conn.close()
+    _audit("centre_create_manual", f"{centre_name} ({seats} seats x {days}d, join code {join_code})")
+    flash(f"Centre '{centre_name}' is active. Join code: {join_code} — the owner sees the dashboard at /centre when they log in with {owner_email}.", "success")
+    return redirect(url_for("admin_bp.manage_centres"))
+
+
+@admin_bp.route("/centres/<int:centre_id>")
+def centre_detail(centre_id):
+    conn = connect()
+    cur = conn.cursor()
+    centre = cur.execute("SELECT * FROM centres WHERE id = ?", (centre_id,)).fetchone()
+    if not centre:
+        conn.close()
+        abort(404)
+    members, subject_rows, weakest = _centre_stats(cur, centre)
+    orders = cur.execute("SELECT * FROM centre_orders WHERE centre_id = ? ORDER BY id DESC", (centre_id,)).fetchall()
+    conn.close()
+    return render_template("admin_centre_detail.html", centre=centre, members=members,
+                           orders=orders, fmt_naira=fmt_naira)
+
+
+@admin_bp.route("/centres/<int:centre_id>/extend", methods=["POST"])
+def extend_centre_route(centre_id):
+    try:
+        seats = max(0, min(500, int(request.form.get("seats") or 0)))
+        days = max(1, min(365, int(request.form.get("days") or 0)))
+    except ValueError:
+        seats, days = 0, 0
+    if days < 1:
+        flash("Enter extra days (1-365) and seats (0-500).", "warning")
+        return redirect(url_for("admin_bp.centre_detail", centre_id=centre_id))
+    conn = connect()
+    cur = conn.cursor()
+    centre = extend_centre(cur, centre_id, seats, days)
+    if not centre:
+        conn.close()
+        abort(404)
+    cur.execute("UPDATE centres SET is_active = 1 WHERE id = ?", (centre_id,))
+    cur.execute("UPDATE access_codes SET is_active = 1 WHERE centre_id = ?", (centre_id,))
+    conn.commit()
+    conn.close()
+    _audit("centre_extend", f"{centre['name']} +{seats} seats +{days}d")
+    flash(f"Extended {centre['name']} — term now ends {centre['expires_at'][:10]}.", "success")
+    return redirect(url_for("admin_bp.centre_detail", centre_id=centre_id))
+
+
+@admin_bp.route("/centres/<int:centre_id>/toggle", methods=["POST"])
+def toggle_centre(centre_id):
+    conn = connect()
+    cur = conn.cursor()
+    centre = cur.execute("SELECT * FROM centres WHERE id = ?", (centre_id,)).fetchone()
+    if not centre:
+        conn.close()
+        abort(404)
+    new_state = 0 if centre["is_active"] else 1
+    cur.execute("UPDATE centres SET is_active = ? WHERE id = ?", (new_state, centre_id))
+    cur.execute("UPDATE access_codes SET is_active = ? WHERE centre_id = ?", (new_state, centre_id))
+    conn.commit()
+    conn.close()
+    _audit("centre_toggle", f"{centre['name']} -> {'active' if new_state else 'disabled'}")
+    flash(f"Centre '{centre['name']}' is now {'active' if new_state else 'disabled (join code blocked)'}.", "success")
+    return redirect(url_for("admin_bp.centre_detail", centre_id=centre_id))
+
+
+# ----------------------------------------------------------------------------
+# Sales Partners (round 14 — applications, commissions, payouts)
+# ----------------------------------------------------------------------------
+
+@admin_bp.route("/admin/partners")
+def manage_partners():
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE partner_commissions SET status = 'AVAILABLE' "
+                "WHERE status = 'CLEARING' AND clears_at <= datetime('now')")
+    pending = cur.execute("SELECT * FROM partners WHERE status = 'PENDING' ORDER BY id").fetchall()
+    partners = cur.execute(
+        """SELECT p.*,
+                  (SELECT COUNT(*) FROM partner_commissions pc WHERE pc.partner_id = p.id) AS sales,
+                  (SELECT COALESCE(SUM(commission), 0) FROM partner_commissions pc
+                    WHERE pc.partner_id = p.id AND pc.status IN ('AVAILABLE', 'REQUESTED', 'PAID')) AS earned,
+                  (SELECT COALESCE(SUM(amount), 0) FROM partner_payouts pp
+                    WHERE pp.partner_id = p.id AND pp.status = 'REQUESTED') AS outstanding,
+                  u.referral_code AS ref_code
+           FROM partners p LEFT JOIN users u ON u.email = p.user_email
+           ORDER BY p.id DESC LIMIT 400""").fetchall()
+    payouts = cur.execute(
+        """SELECT pp.*, p.name AS partner_name, p.user_email, p.bank_name, p.account_number, p.account_name
+           FROM partner_payouts pp JOIN partners p ON p.id = pp.partner_id
+           ORDER BY pp.id DESC LIMIT 100""").fetchall()
+    detail = detail_comms = None
+    pid = request.args.get("id", type=int)
+    if pid:
+        detail = cur.execute("SELECT * FROM partners WHERE id = ?", (pid,)).fetchone()
+        detail_comms = cur.execute(
+            "SELECT * FROM partner_commissions WHERE partner_id = ? ORDER BY id DESC LIMIT 100",
+            (pid,)).fetchall()
+    conn.commit()
+    conn.close()
+    return render_template("admin_partners.html", pending=pending, partners=partners,
+                           payouts=payouts, detail=detail, detail_comms=detail_comms)
+
+
+@admin_bp.route("/admin/partner_action/<int:pid>", methods=["POST"])
+def partner_action(pid):
+    action = (request.form.get("action") or "").strip()
+    conn = connect()
+    cur = conn.cursor()
+    partner = cur.execute("SELECT * FROM partners WHERE id = ?", (pid,)).fetchone()
+    if not partner:
+        conn.close()
+        abort(404)
+    if action == "approve" and partner["status"] != "ACTIVE":
+        code = ensure_referral_code(cur, partner["user_email"])
+        cur.execute("UPDATE partners SET status = 'ACTIVE', approved_at = CURRENT_TIMESTAMP WHERE id = ?", (pid,))
+        conn.commit()
+        link = f"{app_url()}/?ref={code}"
+        send_email(
+            "Your PrepNova Partner account is live",
+            partner["user_email"],
+            (f"Hello {partner['name']},\n\nGood news — your PrepNova Partner application is approved!\n\n"
+             f"Your personal link (share it anywhere — WhatsApp, TikTok, class groups):\n{link}\n\n"
+             f"When someone buys through your link, you earn 30% of their first purchase. "
+             f"Track everything in your dashboard: {app_url()}/partner\n\n"
+             f"Tip: you can also append ?ref={code} to ANY PrepNova page link, e.g. the offline simulator page.\n\n"
+             f"Welcome aboard!\nPrepNova Team"),
+            email_wrap("You're a PrepNova Partner now",
+                       f"Hello <b>{partner['name']}</b>,<br><br>Your application is approved. "
+                       f"Share your personal link and earn <b>30%</b> of every first purchase:",
+                       "Open my dashboard", f"{app_url()}/partner"))
+        _audit("partner_approve", f"{partner['name']} <{partner['user_email']}>")
+        flash(f"{partner['name']} approved — partner link {link} has been emailed.", "success")
+    elif action == "reject":
+        note = (request.form.get("note") or "")[:300]
+        cur.execute("UPDATE partners SET status = 'REJECTED', notes = ? WHERE id = ?", (note, pid))
+        conn.commit()
+        _audit("partner_reject", f"{partner['name']} <{partner['user_email']}>")
+        flash(f"Application from {partner['name']} rejected.", "info")
+    elif action == "ban":
+        cur.execute("UPDATE partners SET status = 'BANNED' WHERE id = ?", (pid,))
+        cur.execute("UPDATE partner_commissions SET status = 'CANCELLED' "
+                    "WHERE partner_id = ? AND status IN ('CLEARING', 'AVAILABLE')", (pid,))
+        conn.commit()
+        _audit("partner_ban", f"{partner['name']} <{partner['user_email']}>")
+        flash(f"{partner['name']} banned and unpaid commissions cancelled.", "warning")
+    else:
+        flash("Unknown partner action.", "danger")
+    conn.close()
+    return redirect(url_for("admin_bp.manage_partners"))
+
+
+@admin_bp.route("/admin/partner_payout_action/<int:pay_id>", methods=["POST"])
+def partner_payout_action(pay_id):
+    action = (request.form.get("action") or "").strip()
+    conn = connect()
+    cur = conn.cursor()
+    payout = cur.execute(
+        """SELECT pp.*, p.name AS partner_name, p.user_email, p.bank_name, p.account_number, p.account_name
+           FROM partner_payouts pp JOIN partners p ON p.id = pp.partner_id WHERE pp.id = ?""",
+        (pay_id,)).fetchone()
+    if not payout:
+        conn.close()
+        abort(404)
+    if payout["status"] != "REQUESTED":
+        flash("That payout has already been processed.", "info")
+        conn.close()
+        return redirect(url_for("admin_bp.manage_partners"))
+    if action == "paid":
+        reference = (request.form.get("reference") or "").strip()[:60] or "bank transfer"
+        cur.execute("UPDATE partner_payouts SET status = 'PAID', paid_at = CURRENT_TIMESTAMP, reference = ?, note = ? WHERE id = ?",
+                    (reference, (request.form.get("note") or "")[:300], pay_id))
+        cur.execute("UPDATE partner_commissions SET status = 'PAID', paid_at = CURRENT_TIMESTAMP WHERE payout_id = ?", (pay_id,))
+        conn.commit()
+        send_email(
+            "PrepNova Partner — your payout has been sent",
+            payout["user_email"],
+            (f"Hello {payout['partner_name']},\n\nYour payout of N{payout['amount']:,.2f} has been sent to "
+             f"{payout['bank_name']} {payout['account_number']}.\nReference: {reference}\n\n"
+             f"Give it up to 24 hours to land, then keep selling!\n\nPrepNova Team"),
+            email_wrap("Payout sent 🎉",
+                       f"Hello <b>{payout['partner_name']}</b>,<br><br>Your payout of "
+                       f"<b>N{payout['amount']:,.2f}</b> is on its way to your <b>{payout['bank_name']}</b> account.",
+                       "Open my dashboard", f"{app_url()}/partner"))
+        _audit("partner_payout", f"#{pay_id} N{payout['amount']:.2f} to {payout['partner_name']}")
+        flash(f"Marked ₦{payout['amount']:,.2f} PAID to {payout['partner_name']} "
+              f"({payout['bank_name']} • {payout['account_number']}).", "success")
+    elif action == "reject":
+        cur.execute("UPDATE partner_payouts SET status = 'REJECTED', note = ? WHERE id = ?",
+                    ((request.form.get("note") or "")[:300], pay_id))
+        cur.execute("UPDATE partner_commissions SET status = 'AVAILABLE', payout_id = NULL WHERE payout_id = ?", (pay_id,))
+        conn.commit()
+        _audit("partner_payout_reject", f"#{pay_id} N{payout['amount']:.2f} to {payout['partner_name']}")
+        flash(f"Payout rejected — N{payout['amount']:,.2f} returned to {payout['partner_name']}'s balance.", "warning")
+    else:
+        flash("Unknown payout action.", "danger")
+    conn.close()
+    return redirect(url_for("admin_bp.manage_partners"))
+
+
+# ----------------------------------------------------------------------------
+# Promo codes (round 15 — coupons / seasonal sales / win-backs)
+# ----------------------------------------------------------------------------
+
+@admin_bp.route("/admin/promos")
+def manage_promos():
+    conn = connect()
+    cur = conn.cursor()
+    promos = cur.execute(
+        """SELECT p.*,
+                  (SELECT COALESCE(SUM(pay.amount), 0) FROM payments pay
+                    WHERE pay.promo_code = p.code AND pay.payment_status = 'SUCCESS') AS revenue
+           FROM promo_codes p ORDER BY p.id DESC LIMIT 300""").fetchall()
+    conn.close()
+    return render_template("admin_promos.html", promos=promos)
+
+
+@admin_bp.route("/admin/promo_new", methods=["POST"])
+def promo_new():
+    code = "".join(ch for ch in (request.form.get("code") or "").upper() if ch.isalnum() or ch == "-")[:24]
+    if not code:
+        code = "PROMO-" + "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(4))
+    kind = "percent" if request.form.get("kind") == "percent" else "amount"
+    try:
+        value = float(request.form.get("value") or 0)
+    except ValueError:
+        value = 0
+    if value <= 0 or (kind == "percent" and value > 90):
+        flash("Enter a sensible discount (percent up to 90, or a naira amount).", "danger")
+        return redirect(url_for("admin_bp.manage_promos"))
+    try:
+        min_amount = float(request.form.get("min_amount") or 0)
+    except ValueError:
+        min_amount = 0
+    try:
+        max_uses = int(request.form.get("max_uses") or 0)
+    except ValueError:
+        max_uses = 0
+    try:
+        days = int(request.form.get("expires_days") or 0)
+    except ValueError:
+        days = 0
+    applies_to = request.form.get("applies_to") if request.form.get("applies_to") in ("all", "plans", "shop") else "all"
+    expires = f"datetime('now', '+{days} days')" if days > 0 else "NULL"
+    note = (request.form.get("note") or "")[:200]
+    conn = connect()
+    cur = conn.cursor()
+    if cur.execute("SELECT 1 FROM promo_codes WHERE code = ?", (code,)).fetchone():
+        conn.close()
+        flash("That code already exists.", "danger")
+        return redirect(url_for("admin_bp.manage_promos"))
+    cur.execute(
+        f"""INSERT INTO promo_codes (code, kind, value, min_amount, max_uses, expires_at, applies_to, note)
+            VALUES (?, ?, ?, ?, ?, {expires}, ?, ?)""",
+        (code, kind, value, min_amount, max_uses, applies_to, note))
+    conn.commit()
+    conn.close()
+    _audit("promo_new", f"{code} {kind} {value}")
+    flash(f"Promo code {code} created.", "success")
+    return redirect(url_for("admin_bp.manage_promos"))
+
+
+@admin_bp.route("/admin/promo_action/<int:pid>", methods=["POST"])
+def promo_action(pid):
+    action = (request.form.get("action") or "").strip()
+    conn = connect()
+    cur = conn.cursor()
+    promo = cur.execute("SELECT * FROM promo_codes WHERE id = ?", (pid,)).fetchone()
+    if not promo:
+        conn.close()
+        abort(404)
+    if action == "toggle":
+        cur.execute("UPDATE promo_codes SET active = ? WHERE id = ?", (0 if promo["active"] else 1, pid))
+        conn.commit()
+        _audit("promo_toggle", f"{promo['code']} -> {'on' if not promo['active'] else 'off'}")
+        flash(f"{promo['code']} is now {'active' if not promo['active'] else 'disabled'}.", "info")
+    conn.close()
+    return redirect(url_for("admin_bp.manage_promos"))

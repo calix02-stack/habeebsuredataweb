@@ -1,0 +1,4714 @@
+"""
+PrepNova CBT — Nigeria's smart exam preparation platform.
+
+Main application: configuration, security middleware, authentication,
+student dashboard, exam room (JAMB / WAEC / Post-UTME), practice mode,
+results, subscriptions (Paystack) and profile management.
+
+Administration routes live in admin_routes.py.
+"""
+
+import hashlib
+import hmac
+import json
+from urllib.parse import quote, urlparse
+import logging
+import os
+import re
+import secrets
+import time
+from datetime import datetime, timedelta, timezone
+
+import requests
+from dotenv import load_dotenv
+from flask import (Flask, abort, flash, g, jsonify, make_response, redirect, render_template, request, session, url_for)
+from markupsafe import Markup
+from flask_mail import Mail
+from werkzeug.exceptions import BadRequest
+from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.security import check_password_hash, generate_password_hash
+
+import exam_engine as engine
+import offline_cbt
+import pdf_store
+import post_utme as putme
+import waec as waecf
+import neco as necof
+from admin_routes import admin_bp
+from admission_tools import tools_bp
+from battle import battle_bp
+from centre import centre_bp
+import centre as centre_mod
+from db import connect, init_db
+import study
+from helpers import (activate_subscription, COURSE_GROUPS, COURSE_ICONS, CUSTOM_COURSE_PREFIX, FREE_PRACTICE_PER_DAY, JAMB_COURSES, JAMB_DURATION_MIN, JAMB_ELECTIVES, LEGACY_TO_V2, SHORT_SUBJECT,
+                     TRIAL_DAYS, WAEC_ENABLED, NECO_ENABLED, MIN_BANK_FOR_V2, app_url, available_subjects, email_wrap,
+                     fetch_question_ids,
+                     fetch_questions, fmt_date, fmt_duration, fmt_naira, get_subscription, initials,
+                     mask_email, practice_allowance, random_question, record_practice_use, resolve_source,
+                     send_email, subject_icon, CHALLENGE_SIZE, REFERRAL_REWARD_DAYS, ensure_referral_code, referral_stats,
+                     share_text, study_streak, clear_mistake, jamb_projection, mistakes_summary, pace_info, record_mistake,
+                     generate_access_codes, pretty_code, redeem_access_code)
+from security import (CSRF_FORM_FIELD, apply_security_headers, client_ip, generate_csrf_token, json_login_required,
+                      login_required, normalise_phone, password_problems, rate_limit, valid_email, validate_csrf,
+                      wants_json_response)
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("prepnova")
+
+
+def utcnow():
+    """Naive UTC timestamp (matches SQLite CURRENT_TIMESTAMP)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+# ---------------------------------------------------------------------------
+# App & configuration
+# ---------------------------------------------------------------------------
+
+app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+# Mode: `python app.py` on a laptop = development (no config needed).
+# Under gunicorn / a hosting platform (Render, Railway, Heroku...) = production, where a
+# real SECRET_KEY and a non-default admin password are mandatory.
+_env = (os.getenv("FLASK_ENV") or "").strip().lower()
+if not _env:
+    _env = "development" if (__name__ == "__main__" and not os.getenv("DYNO") and not os.getenv("RENDER")
+                             and not os.getenv("RAILWAY_ENVIRONMENT")) else "production"
+IS_PRODUCTION = _env == "production" and os.getenv("FLASK_DEBUG", "0") != "1"
+# Development-only: lets the app run inside a hosted preview frame (never honoured in production).
+PREVIEW_EMBED = (not IS_PRODUCTION) and os.getenv("PREVIEW_EMBED", "0") == "1"
+
+_secret = (os.getenv("SECRET_KEY") or "").strip()
+if not _secret or _secret.startswith("#") or _secret == "replace_with_a_long_random_secret" or len(_secret) < 32:
+    if IS_PRODUCTION:
+        raise RuntimeError(
+            "SECRET_KEY is missing or too short (need 32+ random characters).\n"
+            "  Generate one:   python -c \"import secrets; print(secrets.token_hex(32))\"\n"
+            "  Then put it in .env as  SECRET_KEY=<that value>  (or set the environment variable).\n"
+            "  Just testing on your own computer? Run:  python app.py  (development mode needs no SECRET_KEY)."
+        )
+    _secret = secrets.token_hex(32)
+    log.warning("SECRET_KEY not configured — using a temporary key (sessions reset on restart).")
+
+app.config.update(
+    SECRET_KEY=_secret,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="None" if PREVIEW_EMBED else "Lax",
+    SESSION_COOKIE_SECURE=PREVIEW_EMBED or os.getenv("SESSION_COOKIE_SECURE", "1" if IS_PRODUCTION else "0") == "1",
+    SESSION_COOKIE_NAME="prepnova_session",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+    MAX_CONTENT_LENGTH=8 * 1024 * 1024,
+    TEMPLATES_AUTO_RELOAD=not IS_PRODUCTION,
+    SEND_FILE_MAX_AGE_DEFAULT=timedelta(days=30),
+    # Mail
+    MAIL_SERVER=os.getenv("MAIL_SERVER", "smtp.gmail.com"),
+    MAIL_PORT=int(os.getenv("MAIL_PORT", "587")),
+    MAIL_USE_TLS=os.getenv("MAIL_USE_TLS", "1") == "1",
+    MAIL_USE_SSL=os.getenv("MAIL_USE_SSL", "0") == "1",
+    MAIL_USERNAME=os.getenv("MAIL_USERNAME", ""),
+    MAIL_PASSWORD=os.getenv("MAIL_PASSWORD", ""),
+    MAIL_DEFAULT_SENDER=(os.getenv("MAIL_SENDER_NAME", "PrepNova CBT"), os.getenv("MAIL_USERNAME", "no-reply@prepnova.ng")),
+)
+mail = Mail(app)
+
+ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
+ADMIN_PASSWORD_HASH = (os.getenv("ADMIN_PASSWORD_HASH") or "").strip()
+_ADMIN_PASSWORD_PLAIN = (os.getenv("ADMIN_PASSWORD") or "").strip()
+if not ADMIN_EMAIL and not IS_PRODUCTION:
+    # Development convenience so the admin console is reachable out of the box.
+    ADMIN_EMAIL, _ADMIN_PASSWORD_PLAIN = "admin@gmail.com", _ADMIN_PASSWORD_PLAIN or "admin123"
+    log.warning("ADMIN_EMAIL/ADMIN_PASSWORD not configured — using the development default admin@gmail.com / admin123.")
+if not ADMIN_PASSWORD_HASH and _ADMIN_PASSWORD_PLAIN:
+    # Support plain password in .env for convenience, but hash it in memory immediately.
+    ADMIN_PASSWORD_HASH = generate_password_hash(_ADMIN_PASSWORD_PLAIN)
+    if IS_PRODUCTION and (_ADMIN_PASSWORD_PLAIN in ("admin123", "admin", "password") or len(_ADMIN_PASSWORD_PLAIN) < 10):
+        raise RuntimeError("ADMIN_PASSWORD is a default/weak value. Set a strong ADMIN_PASSWORD of 10+ characters (or ADMIN_PASSWORD_HASH).")
+if IS_PRODUCTION and not (ADMIN_EMAIL and ADMIN_PASSWORD_HASH):
+    log.warning("ADMIN_EMAIL/ADMIN_PASSWORD not set — the admin console is disabled until they are configured.")
+del _ADMIN_PASSWORD_PLAIN
+
+PAYSTACK_PUBLIC_KEY = (os.getenv("PAYSTACK_PUBLIC_KEY") or "").strip()
+PAYSTACK_SECRET_KEY = (os.getenv("PAYSTACK_SECRET_KEY") or "").strip()
+# Placeholders from .env.example must not count as "configured"
+if not PAYSTACK_SECRET_KEY.startswith(("sk_test_", "sk_live_")) or PAYSTACK_SECRET_KEY.endswith("_xxx") or len(PAYSTACK_SECRET_KEY) < 20:
+    if PAYSTACK_SECRET_KEY:
+        log.warning("PAYSTACK_SECRET_KEY looks like a placeholder — online payment disabled until a real key is set.")
+    PAYSTACK_SECRET_KEY = ""
+if not PAYSTACK_PUBLIC_KEY.startswith(("pk_test_", "pk_live_")) or PAYSTACK_PUBLIC_KEY.endswith("_xxx"):
+    PAYSTACK_PUBLIC_KEY = ""
+if PAYSTACK_SECRET_KEY and PAYSTACK_PUBLIC_KEY and PAYSTACK_SECRET_KEY[3:8] != PAYSTACK_PUBLIC_KEY[3:8]:
+    log.warning("Paystack keys are mixed: one is test and one is live. Use a matching pair from the same mode.")
+if IS_PRODUCTION and PAYSTACK_SECRET_KEY.startswith("sk_test_"):
+    log.warning("Paystack is in TEST mode — real cards will be declined. Switch to sk_live_/pk_live_ keys before launch.")
+app.config["PAYSTACK_READY"] = bool(PAYSTACK_SECRET_KEY)
+SUPPORT_EMAIL = os.getenv("SUPPORT_EMAIL", "support@prepnova.ng")
+SUPPORT_WHATSAPP = os.getenv("SUPPORT_WHATSAPP", "")
+SESSION_IDLE_MINUTES = int(os.getenv("SESSION_IDLE_MINUTES", "60"))
+EXAM_IDLE_MINUTES = 240  # never time a student out during a live exam
+
+app.register_blueprint(admin_bp)
+app.register_blueprint(tools_bp)
+app.register_blueprint(battle_bp)
+app.register_blueprint(centre_bp)
+
+init_db()
+
+# ---------------------------------------------------------------------------
+# Template helpers
+# ---------------------------------------------------------------------------
+
+_POST_UTME_CACHE = {"t": 0.0, "ready": False, "n": 0}
+
+
+_WAEC_CACHE = {"t": 0, "ready": False, "n": 0, "names": []}
+
+
+def _waec_ready():
+    """True once WAEC mocks can run: switch not forced off and at least one subject has a usable
+    bank (cached 60 s)."""
+    if not WAEC_ENABLED:
+        return False
+    now = time.time()
+    if now - _WAEC_CACHE["t"] > 60:
+        try:
+            names = sorted(available_subjects("WAEC"))
+        except Exception:
+            names = []
+        _WAEC_CACHE.update(t=now, ready=len(names) > 0, n=len(names), names=names)
+    return _WAEC_CACHE["ready"]
+
+
+def _waec_count():
+    _waec_ready()
+    return _WAEC_CACHE["n"]
+
+
+def _waec_names():
+    _waec_ready()
+    return _WAEC_CACHE["names"]
+
+
+_NECO_CACHE = {"t": 0, "ready": False, "n": 0, "names": []}
+
+
+def _neco_ready():
+    """True once NECO mocks can run: switch not forced off and at least one subject has a
+    usable bank (cached 60 s)."""
+    if not NECO_ENABLED:
+        return False
+    now = time.time()
+    if now - _NECO_CACHE["t"] > 60:
+        try:
+            names = sorted(available_subjects("NECO"))
+        except Exception:
+            names = []
+        _NECO_CACHE.update(t=now, ready=len(names) > 0, n=len(names), names=names)
+    return _NECO_CACHE["ready"]
+
+
+def _neco_count():
+    _neco_ready()
+    return _NECO_CACHE["n"]
+
+
+def _neco_names():
+    _neco_ready()
+    return _NECO_CACHE["names"]
+
+
+def _post_utme_ready():
+    """True once Post-UTME mocks can run: at least one active university format and a JAMB bank to
+    draw from (cached 60 s)."""
+    now = time.time()
+    if now - _POST_UTME_CACHE["t"] > 60:
+        try:
+            conn = connect()
+            n = conn.execute("SELECT COUNT(*) FROM post_utme_universities WHERE COALESCE(status, 'Active') = 'Active'").fetchone()[0]
+            banks = conn.execute(
+                """SELECT COUNT(DISTINCT s.id) FROM subjects s JOIN exam_types e ON e.id = s.exam_type_id
+                   JOIN questions_v2 q ON q.subject_id = s.id AND q.status = 'Active'
+                   WHERE e.exam_name = 'JAMB' AND s.subject_name = 'Use of English'"""
+            ).fetchone()[0]
+            conn.close()
+            _POST_UTME_CACHE.update(t=now, ready=n > 0 and banks > 0, n=n)
+        except Exception:
+            _POST_UTME_CACHE.update(t=now, ready=False, n=0)
+    return _POST_UTME_CACHE["ready"]
+
+
+def _post_utme_count():
+    _post_utme_ready()
+    return _POST_UTME_CACHE["n"]
+
+
+REPORT_REASONS = {
+    "wrong_answer": "The marked answer is wrong",
+    "typo": "Typo or unclear wording",
+    "no_correct": "No option is correct / options repeat",
+    "explanation": "Explanation is wrong or unhelpful",
+    "off_syllabus": "Not in the JAMB syllabus",
+    "other": "Something else",
+}
+REPORTS_PER_DAY = 20
+
+
+@app.context_processor
+def inject_globals():
+    return {
+        "csrf_token": generate_csrf_token,
+        "csrf_field": CSRF_FORM_FIELD,
+        "brand": "PrepNova CBT",
+        "support_email": SUPPORT_EMAIL,
+        "support_whatsapp": SUPPORT_WHATSAPP,
+        "support_whatsapp_link": _wa_link(),
+        "waec_enabled": _waec_ready(),
+        "waec_subject_count": _waec_count(),
+        "waec_subject_names": _waec_names(),
+        "neco_enabled": _neco_ready(),
+        "neco_subject_count": _neco_count(),
+        "neco_subject_names": _neco_names(),
+        "post_utme_ready": _post_utme_ready(),
+        "post_utme_count": _post_utme_count(),
+        "current_year": datetime.now().year,
+        "initials": initials,
+        "subject_icon": subject_icon,
+        "fmt_naira": fmt_naira,
+        "fmt_date": fmt_date,
+        "fmt_duration": fmt_duration,
+        "mask_email": mask_email,
+        "paystack_public_key": PAYSTACK_PUBLIC_KEY,
+        "report_reasons": REPORT_REASONS,
+    }
+
+
+_TABLE_LINE = re.compile(r"\S {3,}\S")
+
+
+def split_passage(text):
+    """Split a passage into ('p', paragraph) and ('table', block) segments.
+
+    Lines whose columns are separated by runs of spaces form the table block (from the first such
+    line to the last, so a wrapped row label stays inside it); the hard-wrapped prose before and
+    after it is re-flowed into paragraphs so it wraps naturally on any screen width.
+    """
+    lines = (text or "").split("\n")
+    idx = [i for i, line in enumerate(lines) if _TABLE_LINE.search(line)]
+    if not idx:
+        return [("p", text or "")]
+    segs = []
+
+    def prose(chunk):
+        for para in re.split(r"\n\s*\n", "\n".join(chunk).strip()):
+            para = " ".join(part.strip() for part in para.split("\n") if part.strip())
+            if para:
+                segs.append(("p", para))
+
+    prose(lines[:idx[0]])
+    segs.append(("table", "\n".join(lines[idx[0]:idx[-1] + 1])))
+    prose(lines[idx[-1] + 1:])
+    return segs
+
+
+@app.template_filter("passage_class")
+def passage_class(text):
+    """Tabular passages (columns separated by runs of spaces) keep their spacing."""
+    return "pn-passage pn-table" if text and _TABLE_LINE.search(text) else "pn-passage"
+
+
+@app.template_filter("passage_html")
+def passage_html(text):
+    """Render a passage box: plain prose keeps its line breaks; table passages get wrapped
+    paragraphs plus a monospace <pre> for the table itself."""
+    if not text:
+        return ""
+    segs = split_passage(text)
+    if len(segs) == 1 and segs[0][0] == "p":
+        return Markup('<div class="pn-passage">{}</div>').format(text)
+    parts = [Markup("<p>{}</p>").format(body) if kind == "p" else Markup('<pre class="pn-tbl">{}</pre>').format(body)
+             for kind, body in segs]
+    return Markup('<div class="pn-passage pn-table">{}</div>').format(Markup("").join(parts))
+
+
+@app.template_filter("say")
+def say_text(text):
+    """Clean text for text-to-speech: strip HTML, drop IPA between slashes, squeeze spaces."""
+    t = re.sub(r"<[^>]+>", " ", str(text or ""))
+    t = re.sub(r"/[^/]{1,14}/", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+@app.template_filter("naira")
+def _naira(v):
+    return fmt_naira(v)
+
+
+@app.template_filter("nicedate")
+def _nicedate(v, fmt="%d %b %Y"):
+    return fmt_date(v, fmt)
+
+
+@app.template_filter("duration")
+def _duration(v):
+    return fmt_duration(v)
+
+
+# ---------------------------------------------------------------------------
+# Request lifecycle: CSRF, session validation, security headers
+# ---------------------------------------------------------------------------
+
+def _stale_form_redirect():
+    """A form was submitted with an expired/missing security token (page left open too long, or the
+    user logged in/out in another tab). Nothing was saved — send them back to try again politely."""
+    flash("That page had been open for a while, so the form was reset for your safety. Nothing was changed — please try again.", "warning")
+    ref = request.referrer or ""
+    try:
+        same_site = urlparse(ref).netloc == request.host
+    except ValueError:
+        same_site = False
+    if same_site and urlparse(ref).path != request.path:
+        return redirect(ref)
+    if request.url_rule is not None and "GET" in (request.url_rule.methods or ()):
+        return redirect(request.path)
+    if session.get("admin") and request.path.startswith(("/admin", "/manage", "/access_codes")):
+        return redirect(url_for("admin_bp.admin"))
+    return redirect(url_for("dashboard") if "user" in session else url_for("home"))
+
+
+@app.before_request
+def _before():
+    g.request_started = time.time()
+    session.permanent = True
+
+    if request.endpoint == "static":
+        return None
+
+    # CSRF on every state-changing request (forms + JSON)
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        if request.endpoint != "paystack_webhook":
+            try:
+                validate_csrf()
+            except BadRequest:
+                # JSON clients (exam room) keep the strict 400; ordinary forms get a friendly retry.
+                if request.is_json or wants_json_response() or request.headers.get("X-CSRFToken"):
+                    raise
+                return _stale_form_redirect()
+
+    # Validate student sessions against the server-side session table
+    if "user" in session:
+        token = session.get("session_token")
+        if not token:
+            session.clear()
+            if wants_json_response():
+                return json_login_required()
+            return redirect(url_for("login"))
+        conn = connect()
+        row = conn.execute(
+            "SELECT id, is_active, last_activity FROM user_sessions WHERE session_token = ? AND username = ?",
+            (token, session["user"]),
+        ).fetchone()
+        if not row or not row["is_active"]:
+            conn.close()
+            session.clear()
+            if wants_json_response():
+                return json_login_required("You were signed out because your account was used on another device.")
+            flash("You were signed out because your account was used on another device.", "warning")
+            return redirect(url_for("login"))
+        idle_limit = EXAM_IDLE_MINUTES if request.endpoint in ("exam_room", "exam_state", "exam_answer", "exam_submit", "exam_event") else SESSION_IDLE_MINUTES
+        try:
+            last = datetime.strptime(row["last_activity"], "%Y-%m-%d %H:%M:%S")
+            if utcnow() - last > timedelta(minutes=idle_limit):
+                conn.execute("UPDATE user_sessions SET is_active = 0 WHERE id = ?", (row["id"],))
+                conn.commit()
+                conn.close()
+                session.clear()
+                if wants_json_response():
+                    return json_login_required("Your session expired after a period of inactivity.")
+                flash("Your session expired after a period of inactivity. Please log in again.", "warning")
+                return redirect(url_for("login"))
+        except (TypeError, ValueError):
+            pass
+        conn.execute("UPDATE user_sessions SET last_activity = CURRENT_TIMESTAMP WHERE id = ?", (row["id"],))
+        conn.commit()
+        conn.close()
+
+    # Admin sessions: absolute lifetime of 8 hours
+    if "admin" in session:
+        issued = session.get("admin_since", 0)
+        if time.time() - issued > 8 * 3600:
+            session.pop("admin", None)
+            session.pop("admin_since", None)
+            flash("Admin session expired. Please log in again.", "warning")
+            return redirect(url_for("admin_login"))
+    return None
+
+
+@app.after_request
+def _after(response):
+    return apply_security_headers(response, https=request.is_secure or request.headers.get("X-Forwarded-Proto") == "https",
+                                  embeddable=PREVIEW_EMBED)
+
+
+# ---------------------------------------------------------------------------
+# Error pages
+# ---------------------------------------------------------------------------
+
+@app.errorhandler(400)
+@app.errorhandler(401)
+@app.errorhandler(403)
+@app.errorhandler(404)
+@app.errorhandler(405)
+@app.errorhandler(413)
+@app.errorhandler(429)
+@app.errorhandler(500)
+def _error(err):
+    code = getattr(err, "code", 500)
+    titles = {400: "Bad request", 401: "Signed out", 403: "Access denied", 404: "Page not found", 405: "Method not allowed",
+              413: "File too large", 429: "Slow down", 500: "Something went wrong"}
+    messages = {
+        400: getattr(err, "description", None) or "The request could not be processed.",
+        401: getattr(err, "description", None) or "Please log in to continue.",
+        403: "You do not have permission to view this page.",
+        404: "The page you are looking for does not exist or has been moved.",
+        405: "That action is not allowed on this page.",
+        413: "The file you uploaded is too large (max 8 MB).",
+        429: getattr(err, "description", None) or "Too many requests. Please wait a moment and try again.",
+        500: "Our team has been notified. Please try again in a moment.",
+    }
+    if code == 500:
+        log.exception("Unhandled error on %s", request.path)
+    wants_json = (request.path.startswith("/api/") or request.headers.get("Accept", "").startswith("application/json")
+                  or request.is_json or request.headers.get("X-CSRFToken"))
+    if wants_json:
+        body = {"ok": False, "error": messages.get(code), "message": messages.get(code)}
+        if code == 401:
+            body["login_required"] = True
+            body["redirect"] = url_for("login")
+        return jsonify(body), code
+    return render_template("error.html", code=code, title=titles.get(code, "Error"), message=messages.get(code)), code
+
+
+# ---------------------------------------------------------------------------
+# Public pages
+# ---------------------------------------------------------------------------
+
+# Landing page: subjects ticker + next-exam countdown (configurable, sensible default)
+def _next_utme_date():
+    """Date shown in the landing countdown. NEXT_UTME_DATE=YYYY-MM-DD in .env overrides; otherwise
+    assume the UTME window opens around mid-April of the coming cycle."""
+    raw = (os.getenv("NEXT_UTME_DATE") or "").strip()
+    today = datetime.now().date()
+    if raw:
+        try:
+            d = datetime.strptime(raw, "%Y-%m-%d").date()
+            if d >= today:
+                return d
+        except ValueError:
+            pass
+    d = datetime(today.year, 4, 18).date()
+    return d if d >= today else datetime(today.year + 1, 4, 18).date()
+
+
+@app.route("/")
+@app.route("/index", endpoint="index")
+def home():
+    if "user" in session:
+        return redirect(url_for("dashboard"))
+    conn = connect()
+    plans = conn.execute("SELECT id, plan_name, price, duration_days, description FROM subscription_plans WHERE is_active = 1 ORDER BY duration_days").fetchall()
+    stats = {
+        "questions": conn.execute("SELECT COUNT(*) FROM questions_v2 WHERE status = 'Active'").fetchone()[0]
+        + conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0],
+        "students": conn.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+        "exams": conn.execute("SELECT COUNT(*) FROM results").fetchone()[0],
+        "subjects": conn.execute("SELECT COUNT(DISTINCT subject_name) FROM subjects WHERE status = 'Active'").fetchone()[0],
+    }
+    ticker = conn.execute(
+        """SELECT s.subject_name, COUNT(q.id) AS n FROM subjects s
+           JOIN questions_v2 q ON q.subject_id = s.id AND q.status = 'Active'
+           JOIN exam_types e ON e.id = s.exam_type_id AND e.exam_name = 'JAMB'
+           WHERE s.status = 'Active' GROUP BY s.subject_name HAVING n >= 50 ORDER BY n DESC"""
+    ).fetchall()
+    conn.close()
+    exam_date = _next_utme_date()
+    return render_template("index.html", plans=plans, stats=stats, courses=["Medicine & Surgery", "Law", "Engineering", "Nursing", "Accounting", "Mass Communication", "Computer Science", "Economics"],
+                           n_courses=len(JAMB_COURSES),
+                           ticker=ticker, exam_date=exam_date, days_to_exam=(exam_date - datetime.now().date()).days)
+
+
+# Public sample question for the landing page ("Try a real question"). Read-only, no answers
+# stored, rate-limited; the correct answer is only revealed after the visitor picks an option.
+_TRY_SUBJECTS = ("Use of English", "Mathematics", "Biology", "Chemistry", "Physics", "Government", "Economics")
+
+
+@app.route("/try_question")
+@rate_limit(limit=60, window_seconds=600, scope="try_question", methods=("GET",))
+def try_question():
+    conn = connect()
+    marks = ",".join("?" * len(_TRY_SUBJECTS))
+    row = conn.execute(
+        f"""SELECT q.id, s.subject_name, q.difficulty, q.question_text, q.option_a, q.option_b, q.option_c, q.option_d,
+                   q.correct_answer, q.explanation
+            FROM questions_v2 q JOIN subjects s ON s.id = q.subject_id
+            WHERE q.status = 'Active' AND s.subject_name IN ({marks})
+              AND length(q.question_text) BETWEEN 30 AND 170
+              AND length(q.option_a) < 45 AND length(q.option_b) < 45 AND length(q.option_c) < 45 AND length(q.option_d) < 45
+              AND length(COALESCE(q.explanation, '')) > 40 AND q.explanation NOT LIKE '%option%is correct%'
+              AND q.question_text NOT LIKE '%passage%' AND q.question_text NOT LIKE '%underlined%' AND q.passage_id IS NULL
+              AND q.id != ?
+            ORDER BY RANDOM() LIMIT 1""",
+        (*_TRY_SUBJECTS, request.args.get("skip", 0, type=int)),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"ok": False}), 404
+    return jsonify({
+        "ok": True, "id": row["id"], "subject": row["subject_name"], "difficulty": row["difficulty"],
+        "text": row["question_text"],
+        "options": {"A": row["option_a"], "B": row["option_b"], "C": row["option_c"], "D": row["option_d"]},
+        "answer": (row["correct_answer"] or "").strip().upper()[:1], "explanation": row["explanation"],
+    })
+
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "time": utcnow().isoformat() + "Z"})
+
+
+@app.route("/privacy")
+def privacy():
+    return render_template("legal.html", page="privacy")
+
+
+@app.route("/terms")
+def terms():
+    return render_template("legal.html", page="terms")
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+def _record_attempt(cur, email, ip, success):
+    cur.execute("INSERT INTO login_attempts (email, ip_address, successful) VALUES (?, ?, ?)", (email, ip, 1 if success else 0))
+
+
+def _login_locked(cur, email, ip, ip_limit=30):
+    """Lock an account after 5 failures in 15 min; lock an IP only after `ip_limit` (Nigerian mobile
+    networks use carrier-grade NAT, so many students legitimately share one IP)."""
+    by_email = cur.execute(
+        "SELECT COUNT(*) FROM login_attempts WHERE email = ? AND successful = 0 AND attempt_time >= datetime('now', '-15 minutes')",
+        (email,),
+    ).fetchone()[0]
+    by_ip = cur.execute(
+        "SELECT COUNT(*) FROM login_attempts WHERE ip_address = ? AND successful = 0 AND attempt_time >= datetime('now', '-15 minutes')",
+        (ip,),
+    ).fetchone()[0]
+    return by_email >= 5 or by_ip >= ip_limit
+
+
+def _start_user_session(cur, user):
+    token = secrets.token_hex(32)
+    cur.execute("UPDATE user_sessions SET is_active = 0 WHERE username = ?", (user["email"],))
+    cur.execute(
+        """
+        INSERT INTO user_sessions (username, session_token, login_time, last_activity, is_active, user_agent, ip_address)
+        VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1, ?, ?)
+        """,
+        (user["email"], token, (request.headers.get("User-Agent") or "")[:255], client_ip()),
+    )
+    cur.execute("UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?", (user["id"],))
+    session.clear()
+    session.permanent = True
+    session["user"] = user["email"]
+    session["name"] = user["name"] or user["email"].split("@")[0].title()
+    session["session_token"] = token
+    generate_csrf_token()
+
+
+def mail_configured():
+    return bool(app.config.get("MAIL_USERNAME") and app.config.get("MAIL_PASSWORD"))
+
+
+def _wa_link():
+    """Clickable WhatsApp link from the SUPPORT_WHATSAPP setting (works for 0XX… and 234… forms)."""
+    digits = re.sub(r"\D", "", SUPPORT_WHATSAPP or "")
+    if digits.startswith("0"):
+        digits = "234" + digits[1:]
+    return f"https://wa.me/{digits}" if digits else ""
+
+
+def _send_verification(cur, email, name):
+    token = secrets.token_urlsafe(32)
+    cur.execute("UPDATE email_verification_tokens SET used = 1 WHERE email = ? AND used = 0", (email,))
+    cur.execute(
+        "INSERT INTO email_verification_tokens (email, token, expires_at) VALUES (?, ?, ?)",
+        (email, token, (utcnow() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    link = f"{app_url()}/verify_email/{token}"
+    body = (f"Hello {name},\n\nWelcome to PrepNova CBT! Please verify your email address by opening this link:\n\n{link}\n\n"
+            f"The link expires in 24 hours. If you did not create this account, you can ignore this message.\n\nPrepNova CBT Team")
+    html = email_wrap("Verify your email address",
+                      f"Hello <b>{name}</b>,<br><br>Welcome to PrepNova CBT — Nigeria's smart CBT practice platform. "
+                      f"Confirm your email to activate your {TRIAL_DAYS}-day free trial.",
+                      "Verify my email", link, "This link expires in 24 hours.")
+    send_email("Verify your PrepNova CBT email", email, body, html)
+
+
+@app.route("/register", methods=["GET", "POST"])
+@rate_limit(limit=8, window_seconds=600, scope="register")
+def register():
+    if "user" in session:
+        return redirect(url_for("dashboard"))
+    form = {"name": "", "email": "", "phone": ""}
+    ref_code = (request.args.get("ref") or request.form.get("ref") or session.get("ref_code") or "").strip().upper()[:12]
+    if ref_code:
+        _c = connect()
+        _ok = _c.execute("SELECT 1 FROM users WHERE referral_code = ?", (ref_code,)).fetchone()
+        _c.close()
+        if _ok:
+            session["ref_code"] = ref_code
+        else:
+            ref_code = ""
+            session.pop("ref_code", None)
+    errors = []
+    if request.method == "POST":
+        form["name"] = " ".join((request.form.get("name") or "").split())[:80]
+        form["email"] = (request.form.get("email") or "").strip().lower()[:254]
+        form["phone"] = (request.form.get("phone") or "").strip()
+        password = request.form.get("password") or ""
+        confirm = request.form.get("confirm_password") or ""
+        agree = request.form.get("agree")
+        errors = []
+
+        if len(form["name"]) < 3:
+            errors.append("Please enter your full name.")
+        if not valid_email(form["email"]):
+            errors.append("Please enter a valid email address.")
+        phone = normalise_phone(form["phone"])
+        if phone is None:
+            errors.append("Enter a valid Nigerian phone number (e.g. 08012345678).")
+        if password != confirm:
+            errors.append("Passwords do not match.")
+        errors += password_problems(password, form["email"], form["name"])
+        if not agree:
+            errors.append("You must accept the Terms of Use and Privacy Policy.")
+
+        if not errors:
+            conn = connect()
+            cur = conn.cursor()
+            exists = cur.execute("SELECT id FROM users WHERE email = ?", (form["email"],)).fetchone()
+            if exists:
+                errors.append("An account with this email already exists. Try logging in instead.")
+            else:
+                now = datetime.now()
+                cur.execute(
+                    "INSERT INTO users (name, email, phone, password, date_joined, status, is_active, email_verified) VALUES (?, ?, ?, ?, ?, 'ACTIVE', 1, 0)",
+                    (form["name"], form["email"], phone, generate_password_hash(password), now.strftime("%Y-%m-%d %H:%M:%S")),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO subscriptions (username, plan_id, plan_name, start_date, end_date, payment_reference, payment_status, is_active, amount_paid, currency)
+                    VALUES (?, 0, 'Free Trial', ?, ?, NULL, 'FREE_TRIAL', 1, 0, 'NGN')
+                    """,
+                    (form["email"], now.strftime("%Y-%m-%d %H:%M:%S"), (now + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d %H:%M:%S")),
+                )
+                if ref_code:
+                    inviter = cur.execute("SELECT email FROM users WHERE referral_code = ? AND lower(email) != ?", (ref_code, form["email"])).fetchone()
+                    if inviter:
+                        cur.execute("UPDATE users SET referred_by = ? WHERE email = ?", (inviter["email"], form["email"]))
+                        cur.execute("INSERT OR IGNORE INTO referrals (referrer_email, referred_email) VALUES (?, ?)", (inviter["email"], form["email"]))
+                    session.pop("ref_code", None)
+                if mail_configured():
+                    _send_verification(cur, form["email"], form["name"])
+                    conn.commit()
+                    conn.close()
+                    session["pending_verification_email"] = form["email"]
+                    return redirect(url_for("verify_email_required"))
+                # No SMTP configured (e.g. first deployment): do not lock students out.
+                log.warning("Mail not configured — auto-verifying %s", form["email"])
+                cur.execute("UPDATE users SET email_verified = 1 WHERE email = ?", (form["email"],))
+                conn.commit()
+                conn.close()
+                flash("Account created! Log in to start your free trial.", "success")
+                return redirect(url_for("login", email=form["email"]))
+            conn.close()
+        for e in errors:
+            flash(e, "danger")
+    return render_template("register.html", form=form, ref_code=ref_code)
+
+
+@app.route("/verify_email_required")
+def verify_email_required():
+    email = session.get("pending_verification_email")
+    return render_template("auth_message.html", kind="verify_required", email=email)
+
+
+@app.route("/resend_verification", methods=["POST"])
+@rate_limit(limit=3, window_seconds=900, scope="resend_verification")
+def resend_verification():
+    email = (request.form.get("email") or session.get("pending_verification_email") or "").strip().lower()
+    if valid_email(email):
+        conn = connect()
+        cur = conn.cursor()
+        user = cur.execute("SELECT name, email_verified FROM users WHERE email = ?", (email,)).fetchone()
+        if user and not user["email_verified"]:
+            _send_verification(cur, email, user["name"] or "Student")
+            conn.commit()
+        conn.close()
+    flash("If that email is registered and unverified, a new verification link has been sent.", "info")
+    session["pending_verification_email"] = email
+    return redirect(url_for("verify_email_required"))
+
+
+@app.route("/verify_email/<token>")
+def verify_email(token):
+    conn = connect()
+    cur = conn.cursor()
+    row = cur.execute("SELECT email, expires_at, used FROM email_verification_tokens WHERE token = ?", (token,)).fetchone()
+    if not row:
+        conn.close()
+        return render_template("auth_message.html", kind="invalid_verification")
+    try:
+        expires = datetime.fromisoformat(str(row["expires_at"]))
+    except ValueError:
+        expires = utcnow() - timedelta(seconds=1)
+    if row["used"]:
+        conn.close()
+        return render_template("auth_message.html", kind="invalid_verification")
+    if utcnow() > expires:
+        conn.close()
+        return render_template("auth_message.html", kind="expired_verification", email=row["email"])
+    cur.execute("UPDATE users SET email_verified = 1 WHERE email = ?", (row["email"],))
+    cur.execute("UPDATE email_verification_tokens SET used = 1 WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
+    session.pop("pending_verification_email", None)
+    flash("Your email has been verified. You can now log in.", "success")
+    return redirect(url_for("login"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+@rate_limit(limit=15, window_seconds=600, scope="login")
+def login():
+    if "user" in session:
+        return redirect(url_for("dashboard"))
+    if request.method == "POST":
+        email = (request.form.get("email") or "").strip().lower()[:254]
+        password = request.form.get("password") or ""
+        ip = client_ip()
+        conn = connect()
+        cur = conn.cursor()
+
+        if _login_locked(cur, email, ip):
+            conn.close()
+            flash("Too many failed login attempts. Please wait 15 minutes and try again.", "danger")
+            return render_template("login.html", email=email), 429
+
+        user = cur.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        if user and check_password_hash(user["password"], password):
+            if not user["email_verified"]:
+                conn.close()
+                session["pending_verification_email"] = email
+                return redirect(url_for("verify_email_required"))
+            if not user["is_active"] or (user["status"] or "").upper() == "SUSPENDED":
+                conn.close()
+                return render_template("auth_message.html", kind="suspended")
+            _record_attempt(cur, email, ip, True)
+            cur.execute("DELETE FROM login_attempts WHERE email = ? AND successful = 0", (email,))
+            next_url = session.get("next_url")
+            _start_user_session(cur, user)
+            conn.commit()
+            conn.close()
+            if next_url and next_url.startswith("/") and not next_url.startswith("//"):
+                return redirect(next_url)
+            return redirect(url_for("dashboard"))
+
+        _record_attempt(cur, email, ip, False)
+        conn.commit()
+        conn.close()
+        flash("Invalid email or password.", "danger")
+        return render_template("login.html", email=email)
+    return render_template("login.html", email=(request.args.get("email") or "")[:254])
+
+
+@app.route("/logout")
+def logout():
+    token = session.get("session_token")
+    user = session.get("user")
+    if user and token:
+        conn = connect()
+        conn.execute("UPDATE user_sessions SET is_active = 0 WHERE username = ? AND session_token = ?", (user, token))
+        conn.commit()
+        conn.close()
+    session.clear()
+    flash("You have been logged out.", "info")
+    return redirect(url_for("home"))
+
+
+@app.route("/forgot_password", methods=["GET", "POST"])
+@rate_limit(limit=5, window_seconds=900, scope="forgot")
+def forgot_password():
+    if request.method == "POST":
+        email = (request.form.get("email") or "").strip().lower()
+        if valid_email(email):
+            # No SMTP on this server (e.g. free hosting that blocks e-mail): never pretend a
+            # link was sent — point the student to WhatsApp support instead.
+            if not mail_configured():
+                return render_template("auth_message.html", kind="reset_no_mail", email=email)
+            conn = connect()
+            cur = conn.cursor()
+            user = cur.execute("SELECT name FROM users WHERE email = ?", (email,)).fetchone()
+            if user:
+                cur.execute("UPDATE password_reset_tokens SET used = 1 WHERE email = ? AND used = 0", (email,))
+                token = secrets.token_urlsafe(32)
+                cur.execute(
+                    "INSERT INTO password_reset_tokens (email, token, expires_at) VALUES (?, ?, ?)",
+                    (email, token, (utcnow() + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")),
+                )
+                conn.commit()
+                link = f"{app_url()}/reset_password/{token}"
+                body = (f"Hello {user['name'] or 'Student'},\n\nWe received a request to reset your PrepNova CBT password. "
+                        f"Open the link below to choose a new password:\n\n{link}\n\nThis link expires in 30 minutes. "
+                        f"If you did not request this, you can ignore this email.\n\nPrepNova CBT Team")
+                html = email_wrap("Reset your password", f"Hello <b>{user['name'] or 'Student'}</b>,<br><br>Click the button below to choose a new password.",
+                                  "Reset password", link, "This link expires in 30 minutes. If you did not request a reset, ignore this email.")
+                send_email("Reset your PrepNova CBT password", email, body, html)
+            conn.close()
+        # Always the same response — do not reveal whether the email exists
+        return render_template("auth_message.html", kind="reset_sent", email=email)
+    return render_template("forgot_password.html", mail_ready=mail_configured())
+
+
+@app.route("/reset_password/<token>", methods=["GET", "POST"])
+@rate_limit(limit=10, window_seconds=900, scope="reset")
+def reset_password(token):
+    conn = connect()
+    cur = conn.cursor()
+    row = cur.execute("SELECT email, expires_at, used FROM password_reset_tokens WHERE token = ?", (token,)).fetchone()
+    if not row or row["used"]:
+        conn.close()
+        return render_template("auth_message.html", kind="invalid_reset")
+    try:
+        expires = datetime.fromisoformat(str(row["expires_at"]))
+    except ValueError:
+        expires = utcnow() - timedelta(seconds=1)
+    if utcnow() > expires:
+        conn.close()
+        return render_template("auth_message.html", kind="expired_reset")
+
+    if request.method == "POST":
+        password = request.form.get("password") or ""
+        confirm = request.form.get("confirm_password") or ""
+        errors = []
+        if password != confirm:
+            errors.append("Passwords do not match.")
+        errors += password_problems(password, row["email"])
+        if errors:
+            for e in errors:
+                flash(e, "danger")
+            conn.close()
+            return render_template("reset_password.html", token=token)
+        cur.execute("UPDATE users SET password = ? WHERE email = ?", (generate_password_hash(password), row["email"]))
+        cur.execute("UPDATE password_reset_tokens SET used = 1 WHERE token = ?", (token,))
+        cur.execute("UPDATE user_sessions SET is_active = 0 WHERE username = ?", (row["email"],))
+        # A successful reset proves ownership: lift any lockout caused by earlier failed attempts
+        cur.execute("DELETE FROM login_attempts WHERE email = ? AND successful = 0", (row["email"],))
+        conn.commit()
+        conn.close()
+        flash("Your password has been changed. Please log in with your new password.", "success")
+        return redirect(url_for("login"))
+    conn.close()
+    return render_template("reset_password.html", token=token)
+
+
+# ---------------------------------------------------------------------------
+# Admin authentication (admin pages themselves live in admin_routes.py)
+# ---------------------------------------------------------------------------
+
+@app.route("/admin_login", methods=["GET", "POST"])
+@rate_limit(limit=6, window_seconds=900, scope="admin_login")
+def admin_login():
+    if session.get("admin"):
+        return redirect(url_for("admin_bp.admin"))
+    if request.method == "POST":
+        email = (request.form.get("email") or "").strip().lower()
+        password = request.form.get("password") or ""
+        ok = bool(ADMIN_EMAIL and ADMIN_PASSWORD_HASH) and hmac.compare_digest(email, ADMIN_EMAIL) and check_password_hash(ADMIN_PASSWORD_HASH, password)
+        conn = connect()
+        cur = conn.cursor()
+        if _login_locked(cur, "admin:" + email, client_ip(), ip_limit=10):
+            conn.close()
+            flash("Too many failed attempts. Try again in 15 minutes.", "danger")
+            return render_template("admin_login.html"), 429
+        _record_attempt(cur, "admin:" + email, client_ip(), ok)
+        conn.commit()
+        conn.close()
+        if ok:
+            session.clear()
+            session["admin"] = email
+            session["admin_since"] = time.time()
+            generate_csrf_token()
+            log.info("Admin login from %s", client_ip())
+            return redirect(url_for("admin_bp.admin"))
+        flash("Invalid administrator credentials.", "danger")
+    return render_template("admin_login.html")
+
+
+@app.route("/admin_logout")
+def admin_logout():
+    session.pop("admin", None)
+    session.pop("admin_since", None)
+    flash("Signed out of the admin console.", "info")
+    return redirect(url_for("admin_login"))
+
+
+# ---------------------------------------------------------------------------
+# Student dashboard & account
+# ---------------------------------------------------------------------------
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    user = session["user"]
+    conn = connect()
+    cur = conn.cursor()
+    stats = cur.execute(
+        "SELECT COUNT(*) AS n, AVG(percentage) AS avg, MAX(percentage) AS best FROM results WHERE username = ?", (user,)
+    ).fetchone()
+    recent = cur.execute(
+        "SELECT id, exam_type, exam_name, percentage, date_taken, status, score, total FROM results WHERE username = ? ORDER BY id DESC LIMIT 5",
+        (user,),
+    ).fetchall()
+    bookmarks = cur.execute("SELECT COUNT(*) FROM bookmarks WHERE username = ?", (user,)).fetchone()[0]
+    sub = get_subscription(user, cur)
+    open_attempt = engine.get_open_attempt(user, cur)
+    weak = cur.execute(
+        """
+        SELECT subject, ROUND(AVG(percentage), 0) AS pct, COUNT(*) AS n
+        FROM result_subjects WHERE username = ? GROUP BY subject HAVING n >= 1 ORDER BY pct ASC LIMIT 4
+        """,
+        (user,),
+    ).fetchall()
+    streak_days = study_streak(cur, user)
+    referral = referral_stats(cur, user)
+    today = datetime.now().strftime("%Y-%m-%d")
+    challenge_row = cur.execute("SELECT score, completed_at FROM daily_challenge WHERE username = ? AND day = ?", (user, today)).fetchone()
+    challenge_done = bool(challenge_row and challenge_row["completed_at"])
+    challenge_score = challenge_row["score"] if challenge_done else None
+    mistakes = mistakes_summary(cur, user)
+    projection = jamb_projection(cur, user)
+    target_row = cur.execute("SELECT target_score, exam_date FROM users WHERE email = ?", (user,)).fetchone()
+    target = target_row["target_score"] if target_row else None
+    exam_date = target_row["exam_date"] if target_row else None
+    days_left = study.countdown(exam_date)
+    live_row, live_win = study.current_live_mock(cur)
+    live_mine = study.my_live_attempt(cur, user, live_row["id"]) if live_row else None
+    coverage = study.syllabus_coverage(cur, user, "JAMB", study.student_subjects(cur, user))
+    cov_avg = round(sum(c["coverage"] for c in coverage) / len(coverage)) if coverage else 0
+    conn.commit()
+    rank_row = cur.execute(
+        """
+        WITH best AS (SELECT username, MAX(percentage) AS p FROM results GROUP BY username)
+        SELECT 1 + COUNT(*) FROM best WHERE p > (SELECT COALESCE(MAX(percentage), -1) FROM results WHERE username = ?)
+        """,
+        (user,),
+    ).fetchone()
+    conn.close()
+    return render_template(
+        "dashboard.html",
+        name=session.get("name"),
+        total_exams=stats["n"] or 0,
+        average=round(stats["avg"] or 0),
+        best=round(stats["best"] or 0),
+        bookmarks=bookmarks,
+        recent=recent,
+        sub=sub,
+        open_attempt=open_attempt,
+        weak=weak,
+        streak_days=streak_days,
+        rank=rank_row[0] if rank_row and (stats["n"] or 0) > 0 else None,
+        referral=referral,
+        challenge_done=challenge_done,
+        challenge_score=challenge_score,
+        challenge_size=CHALLENGE_SIZE,
+        mistakes=mistakes,
+        projection=projection,
+        target=target,
+        exam_date=exam_date,
+        days_left=days_left,
+        live_win=live_win,
+        live_mine=live_mine,
+        cov_avg=cov_avg,
+        coverage_n=len(coverage),
+    )
+
+
+@app.route("/profile")
+@login_required
+def profile():
+    conn = connect()
+    cur = conn.cursor()
+    user = cur.execute("SELECT name, email, phone, status, date_joined, last_login, school, state_of_origin FROM users WHERE email = ?", (session["user"],)).fetchone()
+    sub = get_subscription(session["user"], cur)
+    sessions = cur.execute(
+        "SELECT id, session_token, login_time, last_activity, user_agent, ip_address FROM user_sessions WHERE username = ? AND is_active = 1 ORDER BY login_time DESC",
+        (session["user"],),
+    ).fetchall()
+    payments = cur.execute(
+        "SELECT plan_name, amount, payment_status, created_at, transaction_reference FROM payments WHERE username = ? ORDER BY id DESC LIMIT 10",
+        (session["user"],),
+    ).fetchall()
+    conn.close()
+    return render_template("profile.html", user=user, sub=sub, sessions=sessions, payments=payments, current_token=session.get("session_token"))
+
+
+@app.route("/edit_profile", methods=["GET", "POST"])
+@login_required
+def edit_profile():
+    conn = connect()
+    cur = conn.cursor()
+    if request.method == "POST":
+        name = " ".join((request.form.get("name") or "").split())[:80]
+        phone = normalise_phone((request.form.get("phone") or "").strip())
+        school = (request.form.get("school") or "").strip()[:120]
+        state = (request.form.get("state_of_origin") or "").strip()[:60]
+        if len(name) < 3:
+            flash("Please enter your full name.", "danger")
+        elif phone is None:
+            flash("Enter a valid Nigerian phone number.", "danger")
+        else:
+            cur.execute("UPDATE users SET name = ?, phone = ?, school = ?, state_of_origin = ? WHERE email = ?", (name, phone, school, state, session["user"]))
+            conn.commit()
+            session["name"] = name
+            conn.close()
+            flash("Profile updated.", "success")
+            return redirect(url_for("profile"))
+    user = cur.execute("SELECT name, email, phone, school, state_of_origin FROM users WHERE email = ?", (session["user"],)).fetchone()
+    conn.close()
+    return render_template("edit_profile.html", user=user)
+
+
+@app.route("/change_password", methods=["GET", "POST"])
+@login_required
+@rate_limit(limit=10, window_seconds=900, scope="change_password")
+def change_password():
+    if request.method == "POST":
+        current = request.form.get("current_password") or ""
+        new = request.form.get("new_password") or ""
+        confirm = request.form.get("confirm_password") or ""
+        conn = connect()
+        cur = conn.cursor()
+        row = cur.execute("SELECT password FROM users WHERE email = ?", (session["user"],)).fetchone()
+        errors = []
+        if not row or not check_password_hash(row["password"], current):
+            errors.append("Your current password is incorrect.")
+        if new != confirm:
+            errors.append("New passwords do not match.")
+        errors += password_problems(new, session["user"], session.get("name"))
+        if new == current and not errors:
+            errors.append("Choose a password different from the current one.")
+        if errors:
+            conn.close()
+            for e in errors:
+                flash(e, "danger")
+            return render_template("change_password.html")
+        cur.execute("UPDATE users SET password = ? WHERE email = ?", (generate_password_hash(new), session["user"]))
+        # Sign out every other device
+        cur.execute("UPDATE user_sessions SET is_active = 0 WHERE username = ? AND session_token != ?", (session["user"], session.get("session_token")))
+        conn.commit()
+        conn.close()
+        flash("Password changed. Other devices have been signed out.", "success")
+        return redirect(url_for("profile"))
+    return render_template("change_password.html")
+
+
+@app.route("/logout_session/<int:session_id>", methods=["POST"])
+@login_required
+def logout_session(session_id):
+    conn = connect()
+    conn.execute(
+        "UPDATE user_sessions SET is_active = 0 WHERE id = ? AND username = ? AND session_token != ?",
+        (session_id, session["user"], session.get("session_token")),
+    )
+    conn.commit()
+    conn.close()
+    flash("Device signed out.", "success")
+    return redirect(url_for("profile"))
+
+
+@app.route("/active_sessions")
+@login_required
+def active_sessions():
+    return redirect(url_for("profile") + "#devices")
+
+
+# ---------------------------------------------------------------------------
+# Exam selection
+# ---------------------------------------------------------------------------
+
+@app.route("/exam_types")
+@login_required
+def exam_types():
+    conn = connect()
+    open_attempt = engine.get_open_attempt(session["user"], conn.cursor())
+    conn.close()
+    return render_template("exam_types.html", open_attempt=open_attempt)
+
+
+@app.route("/jamb_courses")
+@login_required
+def jamb_courses():
+    avail = available_subjects("JAMB")
+    groups = []
+    for group_name, items in COURSE_GROUPS:
+        courses = []
+        for course, subjects in items:
+            ready = all(s in avail for s in subjects)
+            icon, tint = COURSE_ICONS.get(course, ("bi-mortarboard", "tint-green"))
+            courses.append({"name": course, "subjects": subjects, "ready": ready, "icon": icon, "tint": tint,
+                            "missing": [s for s in subjects if s not in avail]})
+        groups.append({"name": group_name, "courses": courses})
+    electives = [s for s in JAMB_ELECTIVES if s in avail]
+    conn = connect()
+    last = conn.execute(
+        "SELECT subjects_json FROM exam_attempts WHERE username = ? AND exam_type = 'JAMB' AND exam_name LIKE ? ORDER BY id DESC LIMIT 1",
+        (session["user"], CUSTOM_COURSE_PREFIX + "%"),
+    ).fetchone()
+    conn.close()
+    last_custom = []
+    if last:
+        try:
+            last_custom = [x for x in json.loads(last["subjects_json"]) if x in electives]
+        except (TypeError, ValueError):
+            last_custom = []
+    return render_template("jamb_courses.html", groups=groups, duration=JAMB_DURATION_MIN, electives=electives,
+                           last_custom=last_custom, total=len(JAMB_COURSES))
+
+
+@app.route("/waec_subjects")
+@login_required
+def waec_subjects():
+    if not _waec_ready():
+        return render_template("waec_subjects.html", subjects=[], coming_soon=True)
+    avail = available_subjects("WAEC")
+    conn = connect()
+    cur = conn.cursor()
+    subjects = []
+    for name in sorted(avail):
+        papers = []
+        for label, count, minutes, note, topic in waecf.papers_for(name):
+            if topic:
+                source, _ = resolve_source(cur, "WAEC", name)
+                n = len(fetch_question_ids(cur, source, "WAEC", name, topics=[topic])) if source else 0
+                if n < MIN_BANK_FOR_V2:
+                    continue
+            papers.append({"label": label, "count": count, "minutes": minutes, "note": note, "bank": n if topic else avail[name]})
+        if papers:
+            subjects.append({"name": name, "icon": subject_icon(name), "count": avail[name], "papers": papers})
+    conn.close()
+    return render_template("waec_subjects.html", subjects=subjects)
+
+
+def _require_subscription():
+    if not get_subscription(session["user"])["active"]:
+        flash("Your free trial or subscription has ended. Choose a plan to continue taking full mock exams.", "warning")
+        return redirect(url_for("subscribe"))
+    return None
+
+
+@app.route("/start_jamb/<course>", methods=["POST"])
+@login_required
+def start_jamb(course):
+    if course not in JAMB_COURSES:
+        abort(404)
+    if (r := _require_subscription()):
+        return r
+    if request.form.get("discard") != "1" and engine.get_open_attempt(session["user"]):
+        flash("You already have an exam in progress. Resume it below, or discard it to start a new one.", "warning")
+        return redirect(url_for("exam_types"))
+    try:
+        attempt_id = engine.create_jamb_attempt(session["user"], course, client_ip(), request.headers.get("User-Agent"))
+    except engine.ExamError as e:
+        flash(str(e), "danger")
+        return redirect(url_for("jamb_courses"))
+    return redirect(url_for("exam_room", attempt_id=attempt_id))
+
+
+@app.route("/start_jamb_custom", methods=["POST"])
+@login_required
+def start_jamb_custom():
+    """'Build my own combination': English + any three subjects the site can examine."""
+    picked = []
+    for s_ in request.form.getlist("subjects"):
+        if s_ in JAMB_ELECTIVES and s_ not in picked:
+            picked.append(s_)
+    if len(picked) != 3:
+        flash("Choose exactly three subjects to go with Use of English.", "warning")
+        return redirect(url_for("jamb_courses"))
+    avail = available_subjects("JAMB")
+    missing = [s_ for s_ in picked if s_ not in avail]
+    if missing:
+        flash(f"Questions for {', '.join(missing)} are still being added. Please choose other subjects for now.", "warning")
+        return redirect(url_for("jamb_courses"))
+    if (r := _require_subscription()):
+        return r
+    if request.form.get("discard") != "1" and engine.get_open_attempt(session["user"]):
+        flash("You already have an exam in progress. Resume it below, or discard it to start a new one.", "warning")
+        return redirect(url_for("exam_types"))
+    name = f"{CUSTOM_COURSE_PREFIX}: " + " · ".join(SHORT_SUBJECT.get(s_, s_) for s_ in picked)
+    try:
+        attempt_id = engine.create_jamb_attempt(session["user"], name, client_ip(), request.headers.get("User-Agent"),
+                                                subjects=["Use of English"] + picked)
+    except engine.ExamError as e:
+        flash(str(e), "danger")
+        return redirect(url_for("jamb_courses"))
+    return redirect(url_for("exam_room", attempt_id=attempt_id))
+
+
+@app.route("/start_waec/<subject>", methods=["POST"])
+@login_required
+def start_waec(subject):
+    if not _waec_ready():
+        flash("WAEC mock exams are coming soon — genuine WAEC questions are being added. JAMB mocks are fully available.", "info")
+        return redirect(url_for("exam_types"))
+    if subject not in available_subjects("WAEC"):
+        abort(404)
+    if (r := _require_subscription()):
+        return r
+    if request.form.get("discard") != "1" and engine.get_open_attempt(session["user"]):
+        flash("You already have an exam in progress. Resume it below, or discard it to start a new one.", "warning")
+        return redirect(url_for("exam_types"))
+    try:
+        attempt_id = engine.create_waec_attempt(session["user"], subject, client_ip(), request.headers.get("User-Agent"),
+                                                paper=request.form.get("paper"))
+    except engine.ExamError as e:
+        flash(str(e), "danger")
+        return redirect(url_for("waec_subjects"))
+    return redirect(url_for("exam_room", attempt_id=attempt_id))
+
+
+# ----------------------------------------------------------------------- NECO
+
+@app.route("/neco_subjects")
+@login_required
+def neco_subjects():
+    if not _neco_ready():
+        return render_template("neco_subjects.html", subjects=[], coming_soon=True)
+    avail = available_subjects("NECO")
+    conn = connect()
+    cur = conn.cursor()
+    subjects = []
+    for name in sorted(avail):
+        papers = []
+        for label, count, minutes, note, topic in necof.papers_for(name):
+            if topic:
+                source, _ = resolve_source(cur, "NECO", name)
+                n = len(fetch_question_ids(cur, source, "NECO", name, topics=[topic])) if source else 0
+                if n < MIN_BANK_FOR_V2:
+                    continue
+            papers.append({"label": label, "count": count, "minutes": minutes, "note": note, "bank": n if topic else avail[name]})
+        if papers:
+            subjects.append({"name": name, "icon": subject_icon(name), "count": avail[name], "papers": papers})
+    conn.close()
+    return render_template("neco_subjects.html", subjects=subjects)
+
+
+@app.route("/start_neco/<subject>", methods=["POST"])
+@login_required
+def start_neco(subject):
+    if not _neco_ready():
+        flash("NECO mock exams are coming soon — genuine NECO questions are being added. JAMB and WAEC mocks are fully available.", "info")
+        return redirect(url_for("exam_types"))
+    if subject not in available_subjects("NECO"):
+        abort(404)
+    if (r := _require_subscription()):
+        return r
+    if request.form.get("discard") != "1" and engine.get_open_attempt(session["user"]):
+        flash("You already have an exam in progress. Resume it below, or discard it to start a new one.", "warning")
+        return redirect(url_for("exam_types"))
+    try:
+        attempt_id = engine.create_neco_attempt(session["user"], subject, client_ip(), request.headers.get("User-Agent"),
+                                                paper=request.form.get("paper"))
+    except engine.ExamError as e:
+        flash(str(e), "danger")
+        return redirect(url_for("neco_subjects"))
+    return redirect(url_for("exam_room", attempt_id=attempt_id))
+
+
+# ----------------------------------------------------------------- Post-UTME
+
+def _post_utme_university(cur, name):
+    row = cur.execute("SELECT * FROM post_utme_universities WHERE university_name = ? AND COALESCE(status, 'Active') = 'Active'",
+                      (name,)).fetchone()
+    return row
+
+
+def _post_utme_ca_ready(cur):
+    source, _ = resolve_source(cur, putme.CA_EXAM, putme.CA_SUBJECT)
+    return bool(source)
+
+
+@app.route("/post_utme")
+@login_required
+def post_utme():
+    conn = connect()
+    cur = conn.cursor()
+    rows = cur.execute(
+        "SELECT * FROM post_utme_universities WHERE COALESCE(status, 'Active') = 'Active' ORDER BY university_name LIKE 'Any other%', university_name"
+    ).fetchall()
+    ca_ready = _post_utme_ca_ready(cur)
+    conn.close()
+    avail = available_subjects("JAMB")
+    unis = []
+    for u in rows:
+        sections = putme.parse_sections(u["sections_json"], u["total_questions"])
+        needs_ca = any(k == "CA" for k, _ in sections)
+        fixed = [k for k, _ in sections if k not in ("ALL", "CA") and k not in putme.PICK_KINDS]
+        ready = bool(avail) and (ca_ready or not needs_ca) and all(k in avail for k in fixed)
+        unis.append({
+            "name": u["university_name"], "short": putme.short_name(u["university_name"]),
+            "duration": u["duration"], "total": putme.sections_total(sections), "note": u["note"] or "",
+            "chips": putme.describe(sections), "ready": ready, "needs_course": putme.needs_course(sections),
+        })
+    return render_template("post_utme.html", universities=unis, ready_count=sum(1 for u in unis if u["ready"]))
+
+
+@app.route("/post_utme_courses")
+@login_required
+def post_utme_courses():
+    """Course picker for one university (same cards as the JAMB page, plus 'build my own')."""
+    university = (request.args.get("university") or "").strip()
+    conn = connect()
+    cur = conn.cursor()
+    uni = _post_utme_university(cur, university)
+    conn.close()
+    if not uni:
+        abort(404)
+    sections = putme.parse_sections(uni["sections_json"], uni["total_questions"])
+    if not putme.needs_course(sections):
+        return redirect(url_for("post_utme_subjects", university=university))
+    avail = available_subjects("JAMB")
+    groups = []
+    for group_name, items in COURSE_GROUPS:
+        courses = []
+        for course, subjects in items:
+            icon, tint = COURSE_ICONS.get(course, ("bi-mortarboard", "tint-green"))
+            courses.append({"name": course, "subjects": subjects, "ready": all(s_ in avail for s_ in subjects),
+                            "icon": icon, "tint": tint, "missing": [s_ for s_ in subjects if s_ not in avail]})
+        groups.append({"name": group_name, "courses": courses})
+    electives = [s_ for s_ in JAMB_ELECTIVES if s_ in avail]
+    return render_template("post_utme_courses.html", university=uni, groups=groups, electives=electives,
+                           total=len(JAMB_COURSES), short=putme.short_name(university))
+
+
+@app.route("/post_utme_subjects", methods=["GET", "POST"])
+@login_required
+def post_utme_subjects():
+    """Confirm page: shows the exact paper (subjects and counts) before the timer starts."""
+    src = request.form if request.method == "POST" else request.args
+    university = (src.get("university") or "").strip()
+    course = (src.get("course") or "").strip()
+    custom = src.getlist("subjects")
+    conn = connect()
+    cur = conn.cursor()
+    uni = _post_utme_university(cur, university)
+    if not uni:
+        conn.close()
+        abort(404)
+    sections = putme.parse_sections(uni["sections_json"], uni["total_questions"])
+    label, subjects = (None, None)
+    if putme.needs_course(sections):
+        label, subjects = putme.course_subjects(course, custom)
+        if not subjects:
+            conn.close()
+            if course or custom:
+                flash("Please choose a course card, or tick exactly three subjects to build your combination.", "warning")
+            return redirect(url_for("post_utme_courses", university=university))
+    pick = putme.pick_count(sections)
+    picked = [s_ for s_ in src.getlist("pick") if subjects and s_ in subjects and s_ != putme.ENGLISH]
+    plan, problem = None, None
+    if pick and len(picked) != pick:
+        problem = f"Tick the {pick} subjects your course is examined on." if not picked else f"Tick exactly {pick} subjects."
+    else:
+        try:
+            plan = putme.build_plan(sections, subjects, picked)
+        except ValueError as e:
+            problem = str(e)
+    avail = available_subjects("JAMB")
+    ca_ready = _post_utme_ca_ready(cur)
+    conn.close()
+    rows = []
+    for s_, n in (plan or []):
+        ok = ca_ready if s_ == putme.CA_SUBJECT else s_ in avail
+        rows.append({"subject": s_, "n": n, "ok": ok})
+    startable = bool(rows) and all(r["ok"] for r in rows)
+    return render_template("post_utme_subjects.html", university=uni, short=putme.short_name(university), course=course,
+                           label=label, subjects=subjects or [], custom=[s_ for s_ in custom if s_ in JAMB_ELECTIVES],
+                           pick=pick, picked=picked, rows=rows, total=sum(r["n"] for r in rows), problem=problem,
+                           startable=startable, note=uni["note"] or "")
+
+
+@app.route("/start_post_utme", methods=["POST"])
+@login_required
+def start_post_utme():
+    university = (request.form.get("university") or "").strip()
+    course = (request.form.get("course") or "").strip()
+    custom = request.form.getlist("subjects")
+    picked = request.form.getlist("pick")
+    conn = connect()
+    cur = conn.cursor()
+    uni = _post_utme_university(cur, university)
+    conn.close()
+    if not uni:
+        abort(404)
+    sections = putme.parse_sections(uni["sections_json"], uni["total_questions"])
+    label, subjects = (None, None)
+    if putme.needs_course(sections):
+        label, subjects = putme.course_subjects(course, custom)
+        if not subjects:
+            flash("Please choose your course first.", "warning")
+            return redirect(url_for("post_utme_courses", university=university))
+    try:
+        plan = putme.build_plan(sections, subjects, [p for p in picked if subjects and p in subjects])
+    except ValueError as e:
+        flash(str(e), "warning")
+        return redirect(url_for("post_utme_subjects", university=university, course=course, subjects=custom))
+    if (r := _require_subscription()):
+        return r
+    if request.form.get("discard") != "1" and engine.get_open_attempt(session["user"]):
+        flash("You already have an exam in progress. Resume it below, or discard it to start a new one.", "warning")
+        return redirect(url_for("exam_types"))
+    try:
+        attempt_id = engine.create_post_utme_attempt(
+            session["user"], university, label, plan, uni["duration"], client_ip(), request.headers.get("User-Agent")
+        )
+    except engine.ExamError as e:
+        flash(str(e), "danger")
+        return redirect(url_for("post_utme"))
+    return redirect(url_for("exam_room", attempt_id=attempt_id))
+
+
+# ---------------------------------------------------------------------------
+# Exam room (server-authoritative)
+# ---------------------------------------------------------------------------
+
+@app.route("/exam/<int:attempt_id>")
+@login_required
+def exam_room(attempt_id):
+    data = engine.load_attempt_for_student(attempt_id, session["user"])
+    if not data:
+        abort(404)
+    if data["status"] != "IN_PROGRESS":
+        conn = connect()
+        row = conn.execute("SELECT result_id FROM exam_attempts WHERE id = ?", (attempt_id,)).fetchone()
+        conn.close()
+        if row and row["result_id"]:
+            return redirect(url_for("result_details", result_id=row["result_id"]))
+        return redirect(url_for("dashboard"))
+    if data["remaining"] <= 0:
+        result_id = engine.finalize_attempt(attempt_id, session["user"], auto=True)
+        return redirect(url_for("result_details", result_id=result_id))
+    return render_template("exam_room.html", attempt=data, attempt_json=json.dumps(data, ensure_ascii=False))
+
+
+@app.route("/exam/<int:attempt_id>/answer", methods=["POST"])
+@login_required
+def exam_answer(attempt_id):
+    payload = request.get_json(silent=True) or {}
+    try:
+        position = int(payload.get("position"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Invalid question."}), 400
+    answer = payload.get("answer") if "answer" in payload else None
+    flagged = payload.get("flagged") if "flagged" in payload else None
+    ok, msg = engine.save_answer(attempt_id, session["user"], position, answer, flagged)
+    if not ok and msg == "TIME_UP":
+        return jsonify({"ok": False, "time_up": True, "redirect": url_for("exam_finish", attempt_id=attempt_id)}), 409
+    if not ok and msg == "Attempt not found.":
+        return jsonify({"ok": False, "message": msg}), 404
+    return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
+
+
+@app.route("/exam/<int:attempt_id>/state")
+@login_required
+def exam_state(attempt_id):
+    conn = connect()
+    att = conn.execute("SELECT status, expires_at FROM exam_attempts WHERE id = ? AND username = ?", (attempt_id, session["user"])).fetchone()
+    conn.close()
+    if not att:
+        return jsonify({"ok": False}), 404
+    remaining = int((datetime.strptime(att["expires_at"], "%Y-%m-%d %H:%M:%S") - datetime.now()).total_seconds())
+    return jsonify({"ok": True, "status": att["status"], "remaining": max(0, remaining), "server_time": time.time()})
+
+
+@app.route("/exam/<int:attempt_id>/event", methods=["POST"])
+@login_required
+def exam_event(attempt_id):
+    payload = request.get_json(silent=True) or {}
+    if payload.get("type") == "tab_switch":
+        engine.record_tab_switch(attempt_id, session["user"])
+    return jsonify({"ok": True})
+
+
+@app.route("/exam/<int:attempt_id>/submit", methods=["POST"])
+@login_required
+def exam_submit(attempt_id):
+    result_id = engine.finalize_attempt(attempt_id, session["user"])
+    if not result_id:
+        abort(404)
+    if request.is_json:
+        return jsonify({"ok": True, "redirect": url_for("result_details", result_id=result_id)})
+    return redirect(url_for("result_details", result_id=result_id))
+
+
+@app.route("/exam/<int:attempt_id>/finish")
+@login_required
+def exam_finish(attempt_id):
+    result_id = engine.finalize_attempt(attempt_id, session["user"], auto=True)
+    if not result_id:
+        abort(404)
+    return redirect(url_for("result_details", result_id=result_id))
+
+
+@app.route("/resume_exam")
+@login_required
+def resume_exam():
+    att = engine.get_open_attempt(session["user"])
+    if not att:
+        flash("You have no exam in progress.", "info")
+        return redirect(url_for("exam_types"))
+    return redirect(url_for("exam_room", attempt_id=att["id"]))
+
+
+@app.route("/abandon_exam", methods=["POST"])
+@login_required
+def abandon_exam():
+    conn = connect()
+    engine.abandon_open_attempts(session["user"], conn.cursor())
+    conn.commit()
+    conn.close()
+    flash("Your unfinished exam has been discarded.", "info")
+    return redirect(url_for("exam_types"))
+
+
+# ---------------------------------------------------------------------------
+# Practice mode (instant feedback)
+# ---------------------------------------------------------------------------
+
+@app.route("/practice")
+@login_required
+def practice():
+    jamb = sorted(available_subjects("JAMB").items())
+    waec = sorted(available_subjects("WAEC").items()) if _waec_ready() else []
+    neco = sorted(available_subjects("NECO").items()) if _neco_ready() else []
+    putme_subjects = sorted(available_subjects("POST-UTME").items())
+    conn = connect()
+    allowed, remaining = practice_allowance(session["user"], conn.cursor())
+    conn.commit()
+    conn.close()
+    return render_template("practice.html", jamb=jamb, waec=waec, neco=neco, putme=putme_subjects, remaining=remaining, free_quota=FREE_PRACTICE_PER_DAY)
+
+
+@app.route("/practice/<exam_type>/<subject>", methods=["GET", "POST"])
+@login_required
+def practice_question(exam_type, subject):
+    exam_type = exam_type.upper()
+    if exam_type not in ("JAMB", "WAEC", "NECO", "POST-UTME"):
+        abort(404)
+    if exam_type == "WAEC" and not _waec_ready():
+        flash("WAEC practice is coming soon — genuine WAEC questions are being added. Try a JAMB subject meanwhile.", "info")
+        return redirect(url_for("practice"))
+    if exam_type == "NECO" and not _neco_ready():
+        flash("NECO practice is coming soon — genuine NECO questions are being added. Try a JAMB or WAEC subject meanwhile.", "info")
+        return redirect(url_for("practice"))
+    conn = connect()
+    cur = conn.cursor()
+    source, count = resolve_source(cur, exam_type, subject)
+    if not source:
+        conn.close()
+        flash("No practice questions are available for that subject yet.", "warning")
+        return redirect(url_for("practice"))
+
+    topic = (request.args.get("topic") or request.form.get("topic") or "").strip()[:120]
+    if topic and source != "questions_v2":
+        topic = ""
+    key = f"practice:{exam_type}:{subject}" + (f":{topic}" if topic else "")
+    state = session.get(key) or {"seen": [], "correct": 0, "total": 0}
+    feedback = None
+
+    if request.method == "POST":
+        qid = request.form.get("question_id", type=int)
+        chosen = (request.form.get("answer") or "").strip().upper()
+        q = fetch_questions(cur, source, [qid], with_answers=True).get(qid) if qid else None
+        if not q or chosen not in ("A", "B", "C", "D"):
+            conn.close()
+            flash("Please choose an option.", "warning")
+            return redirect(url_for("practice_question", exam_type=exam_type, subject=subject, topic=topic or None))
+        is_correct = chosen == q["correct"]
+        if q.get("topic"):
+            study.record_topic_progress(cur, session["user"], exam_type, subject, q["topic"], is_correct)
+        state["total"] += 1
+        state["correct"] += 1 if is_correct else 0
+        session[key] = state
+        session.modified = True
+        if is_correct:
+            clear_mistake(cur, session["user"], source, qid)
+        else:
+            record_mistake(cur, session["user"], source, qid, subject, exam_type)
+        conn.commit()
+        conn.close()
+        q["source"] = source
+        feedback = {"q": q, "chosen": chosen, "is_correct": is_correct}
+        return render_template("practice_question.html", exam_type=exam_type, subject=subject, q=q, feedback=feedback,
+                               state=state, remaining=None, bookmarked=_is_bookmarked(qid, source), topic=topic)
+
+    allowed, remaining = practice_allowance(session["user"], cur)
+    if not allowed:
+        conn.commit()
+        conn.close()
+        flash(f"You have used your {FREE_PRACTICE_PER_DAY} free practice questions for today. Subscribe for unlimited practice.", "warning")
+        return redirect(url_for("subscribe"))
+    q = random_question(cur, source, exam_type, subject, exclude_ids=state["seen"][-200:], topic=topic or None)
+    if not q and topic:
+        conn.close()
+        flash(f"No practice questions are filed under '{topic}' yet — here is the whole subject instead.", "info")
+        return redirect(url_for("practice_question", exam_type=exam_type, subject=subject))
+    if not q:
+        conn.close()
+        flash("No practice questions are available for that subject yet.", "warning")
+        return redirect(url_for("practice"))
+    record_practice_use(session["user"], cur)
+    conn.commit()
+    state["seen"] = (state["seen"] + [q["id"]])[-200:]
+    session[key] = state
+    session.modified = True
+    q_public = {k: v for k, v in q.items() if k not in ("correct", "explanation")}
+    q_public["source"] = source
+    bookmarked = _is_bookmarked(q["id"], source)
+    conn.close()
+    return render_template("practice_question.html", exam_type=exam_type, subject=subject, q=q_public, feedback=None,
+                           state=state, remaining=(None if remaining is None else remaining - 1), bookmarked=bookmarked, topic=topic)
+
+
+@app.route("/practice/<exam_type>/<subject>/reset", methods=["POST"])
+@login_required
+def practice_reset(exam_type, subject):
+    topic = (request.args.get("topic") or request.form.get("topic") or "").strip()[:120]
+    session.pop(f"practice:{exam_type.upper()}:{subject}" + (f":{topic}" if topic else ""), None)
+    return redirect(url_for("practice_question", exam_type=exam_type, subject=subject, topic=topic or None))
+
+
+# ---------------------------------------------------------------------------
+# Bookmarks
+# ---------------------------------------------------------------------------
+
+def _is_bookmarked(qid, source):
+    if not qid:
+        return False
+    conn = connect()
+    row = conn.execute("SELECT 1 FROM bookmarks WHERE username = ? AND question_id = ? AND COALESCE(question_source, 'questions_v2') = ?",
+                       (session["user"], qid, source)).fetchone()
+    conn.close()
+    return bool(row)
+
+
+@app.route("/bookmark_question", methods=["POST"])
+@login_required
+def bookmark_question():
+    qid = request.form.get("question_id", type=int)
+    source = request.form.get("source") or "questions_v2"
+    exam_type = (request.form.get("exam_type") or "").upper()
+    subject = request.form.get("subject") or ""
+    if source not in ("questions_v2", "questions", "post_utme_questions") or not qid:
+        abort(400)
+    conn = connect()
+    existing = conn.execute("SELECT id FROM bookmarks WHERE username = ? AND question_id = ? AND COALESCE(question_source, 'questions_v2') = ?",
+                            (session["user"], qid, source)).fetchone()
+    if existing:
+        conn.execute("DELETE FROM bookmarks WHERE id = ?", (existing["id"],))
+        msg = "Bookmark removed."
+    else:
+        conn.execute("INSERT INTO bookmarks (username, question_id, exam_type, subject, question_source) VALUES (?, ?, ?, ?, ?)",
+                     (session["user"], qid, exam_type, subject, source))
+        msg = "Question saved to your bookmarks."
+    conn.commit()
+    conn.close()
+    if request.is_json or request.headers.get("X-Requested-With") == "fetch":
+        return jsonify({"ok": True, "message": msg, "bookmarked": not existing})
+    flash(msg, "success")
+    return redirect(request.referrer or url_for("my_bookmarks"))
+
+
+@app.route("/report_question", methods=["POST"])
+@login_required
+def report_question():
+    """Students flag a faulty question; it lands in Admin -> Reported questions."""
+    data = request.get_json(silent=True) or request.form
+    try:
+        qid = int(data.get("question_id") or 0)
+    except (TypeError, ValueError):
+        qid = 0
+    source = (data.get("source") or "questions_v2")[:30]
+    reason = (data.get("reason") or "")[:30]
+    note = " ".join(str(data.get("note") or "").split())[:500]
+    subject = str(data.get("subject") or "")[:80]
+    exam_type = str(data.get("exam_type") or "").upper()[:20]
+    attempt_id = data.get("attempt_id")
+    result_id = str(data.get("result_id") or "")[:60] or None
+    wants_json = request.is_json or request.headers.get("X-Requested-With") == "fetch"
+
+    def fail(msg, code=400):
+        if wants_json:
+            return jsonify({"ok": False, "message": msg}), code
+        flash(msg, "warning")
+        return redirect(request.referrer or url_for("dashboard"))
+
+    if source not in ("questions_v2", "questions", "post_utme_questions") or not qid or reason not in REPORT_REASONS:
+        return fail("Please choose what is wrong with the question.")
+    if reason == "other" and len(note) < 5:
+        return fail("Please describe the problem in a few words.")
+    try:
+        attempt_id = int(attempt_id) if attempt_id not in (None, "") else None
+    except (TypeError, ValueError):
+        attempt_id = None
+    conn = connect()
+    cur = conn.cursor()
+    if not fetch_questions(cur, source, [qid], with_answers=False).get(qid):
+        conn.close()
+        return fail("That question no longer exists.", 404)
+    today = cur.execute("SELECT COUNT(*) FROM question_reports WHERE username = ? AND created_at >= datetime('now', '-1 day')",
+                        (session["user"],)).fetchone()[0]
+    if today >= REPORTS_PER_DAY:
+        conn.close()
+        return fail("You have sent many reports today. Thank you — please continue tomorrow.", 429)
+    dup = cur.execute("SELECT id FROM question_reports WHERE username = ? AND question_source = ? AND question_id = ? AND status = 'open'",
+                      (session["user"], source, qid)).fetchone()
+    if dup:
+        conn.close()
+        msg = "You already reported this question. Our team will look at it."
+        return jsonify({"ok": True, "message": msg, "duplicate": True}) if wants_json else (flash(msg, "info") or redirect(request.referrer or url_for("dashboard")))
+    cur.execute(
+        """INSERT INTO question_reports (username, question_source, question_id, subject, exam_type, attempt_id, result_id, reason, note)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (session["user"], source, qid, subject, exam_type, attempt_id, result_id, reason, note or None),
+    )
+    conn.commit()
+    conn.close()
+    msg = "Thank you. The question has been sent to our team for checking."
+    if wants_json:
+        return jsonify({"ok": True, "message": msg})
+    flash(msg, "success")
+    return redirect(request.referrer or url_for("dashboard"))
+
+
+@app.route("/my_bookmarks")
+@login_required
+def my_bookmarks():
+    conn = connect()
+    cur = conn.cursor()
+    rows = cur.execute(
+        "SELECT id, question_id, exam_type, subject, COALESCE(question_source, 'questions_v2') AS src, bookmarked_at FROM bookmarks WHERE username = ? ORDER BY id DESC",
+        (session["user"],),
+    ).fetchall()
+    by_source = {}
+    for r in rows:
+        by_source.setdefault(r["src"], []).append(r["question_id"])
+    bank = {s: fetch_questions(cur, s, ids, with_answers=True) for s, ids in by_source.items()}
+    items = []
+    for r in rows:
+        q = bank.get(r["src"], {}).get(r["question_id"])
+        if q:
+            items.append({"id": r["id"], "exam_type": r["exam_type"], "subject": r["subject"], "q": q, "date": r["bookmarked_at"]})
+    conn.close()
+    return render_template("my_bookmarks.html", items=items)
+
+
+@app.route("/delete_bookmark/<int:bookmark_id>", methods=["POST"])
+@login_required
+def delete_bookmark(bookmark_id):
+    conn = connect()
+    conn.execute("DELETE FROM bookmarks WHERE id = ? AND username = ?", (bookmark_id, session["user"]))
+    conn.commit()
+    conn.close()
+    flash("Bookmark removed.", "info")
+    return redirect(url_for("my_bookmarks"))
+
+
+# ---------------------------------------------------------------------------
+# Results
+# ---------------------------------------------------------------------------
+
+@app.route("/my_results")
+@login_required
+def my_results():
+    conn = connect()
+    rows = conn.execute("SELECT * FROM results WHERE username = ? ORDER BY id DESC LIMIT 200", (session["user"],)).fetchall()
+    conn.close()
+    return render_template("my_results.html", results=rows)
+
+
+@app.route("/result_details/<int:result_id>")
+@login_required
+def result_details(result_id):
+    data = engine.load_result(result_id, session["user"])
+    if not data:
+        abort(404)
+    r = data["result"]
+    pct = r["percentage"] or 0
+    if r["exam_type"] == "POST-UTME":
+        # Screening scores are usually combined with UTME and O'level; 50% is the common pass bar.
+        if pct >= 70:
+            verdict, tone = "Strong screening score — this is the range competitive courses admit from.", "success"
+        elif pct >= 50:
+            verdict, tone = "Above the usual 50% screening bar. Push higher: admission lists rank by aggregate.", "warning"
+        else:
+            verdict, tone = "Below the usual 50% screening bar — review each section's corrections and try again.", "danger"
+    elif pct >= 70:
+        verdict, tone = "Excellent performance — keep it up!", "success"
+    elif pct >= 50:
+        verdict, tone = "Good effort. Review your weak subjects and try again.", "warning"
+    else:
+        verdict, tone = "Keep practising — focus on the explanations for the questions you missed.", "danger"
+    if r["exam_type"] == "JAMB" and r["jamb_score"] is not None:
+        score_txt = f"{r['jamb_score']}/400"
+    else:
+        score_txt = f"{r['score']}/{r['total']}"
+    attempt = data["attempt"]
+    allowed_pace = (attempt["duration_seconds"] // max(1, r["total"])) if (attempt and attempt["duration_seconds"] and r["total"]) else None
+    pace = pace_info(r["duration"], r["total"], r["exam_type"], allowed=allowed_pace)
+    ssce_grade = (waecf.grade(pct) or necof.grade(pct)) if r["exam_type"] in ("WAEC", "NECO") else None
+    conn = connect()
+    projection = jamb_projection(conn.cursor(), session["user"]) if r["exam_type"] == "JAMB" else None
+    target = conn.execute("SELECT target_score FROM users WHERE email = ?", (session["user"],)).fetchone()
+    conn.close()
+    target = target["target_score"] if target else None
+    share_url = f"{app_url()}/verify_result/{r['verification_code']}" if r["verification_code"] else app_url()
+    share = share_text(session.get("name"), f"{r['exam_type']} {r['exam_name'] or ''}".strip(), score_txt, pct, share_url)
+    topics = engine.topic_report(result_id, session["user"])
+    return render_template("result_details.html", r=r, subjects=data["subjects"], attempt=attempt, verdict=verdict, tone=tone,
+                           just_finished=request.args.get("done") == "1", share=share, share_url=share_url,
+                           pace=pace, projection=projection, target=target, topics=topics,
+                           ssce_grade=ssce_grade, ssce_exam=r["exam_type"])
+
+
+@app.route("/review_answers/<int:result_id>")
+@login_required
+def review_answers(result_id):
+    r, items = engine.load_review(result_id, session["user"])
+    if not r:
+        abort(404)
+    show = request.args.get("show", "all")
+    if show == "wrong":
+        items = [i for i in items if not i["is_correct"]]
+    subjects = sorted({i["subject"] for i in items})
+    return render_template("review_answers.html", r=r, items=items, show=show, subjects=subjects)
+
+
+@app.route("/result/<int:result_id>/pdf")
+@login_required
+def download_my_result(result_id):
+    data = engine.load_result(result_id, session["user"])
+    if not data:
+        abort(404)
+    return _result_pdf(data)
+
+
+@app.route("/verify_result/<code>")
+def verify_result(code):
+    conn = connect()
+    r = conn.execute(
+        "SELECT r.*, u.name AS student_name FROM results r LEFT JOIN users u ON u.email = r.username WHERE r.verification_code = ?",
+        (code[:40],),
+    ).fetchone()
+    subjects = []
+    if r:
+        subjects = conn.execute("SELECT subject, score, total_questions, percentage FROM result_subjects WHERE result_id = ? ORDER BY id", (str(r["id"]),)).fetchall()
+    conn.close()
+    return render_template("verify_result.html", r=r, subjects=subjects, code=code)
+
+
+def _result_pdf(data):
+    from io import BytesIO
+
+    import qrcode
+    from flask import send_file
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    r = data["result"]
+    user = data["user"]
+    styles = getSampleStyleSheet()
+    brand = ParagraphStyle("brand", parent=styles["Title"], fontSize=20, textColor=colors.HexColor("#0f1f3d"), spaceAfter=2, alignment=0)
+    sub = ParagraphStyle("sub", parent=styles["Normal"], fontSize=9, textColor=colors.HexColor("#6b7280"))
+    h = ParagraphStyle("h", parent=styles["Heading2"], fontSize=13, textColor=colors.HexColor("#0b7a4b"), spaceBefore=10, spaceAfter=6)
+    body = ParagraphStyle("body", parent=styles["Normal"], fontSize=10, leading=14)
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm, bottomMargin=16 * mm,
+                            title=f"PrepNova result {r['verification_code']}")
+    story = [Paragraph("PrepNova CBT", brand), Paragraph("Official Practice Result Slip — Practice. Prepare. Pass.", sub), Spacer(1, 10)]
+
+    info = [
+        ["Student", user["name"] if user else r["username"], "Exam", f"{r['exam_type']} — {r['exam_name'] or '-'}"],
+        ["Email", r["username"], "Date", fmt_date(r["date_taken"], "%d %b %Y, %I:%M %p")],
+        ["Phone", (user["phone"] if user and user["phone"] else "-"), "Duration", fmt_duration(r["duration"])],
+        ["Verification code", r["verification_code"] or "-", "Status", r["status"] or "-"],
+    ]
+    t = Table(info, colWidths=[32 * mm, 58 * mm, 26 * mm, 58 * mm])
+    t.setStyle(TableStyle([
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#6b7280")),
+        ("TEXTCOLOR", (2, 0), (2, -1), colors.HexColor("#6b7280")),
+        ("FONTNAME", (1, 0), (1, -1), "Helvetica-Bold"),
+        ("FONTNAME", (3, 0), (3, -1), "Helvetica-Bold"),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.3, colors.HexColor("#e5e7eb")),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6), ("TOPPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story += [t, Spacer(1, 8)]
+
+    score_rows = [["Score", f"{r['score']} / {r['total']}"], ["Percentage", f"{r['percentage']}%"]]
+    if r["jamb_score"] is not None:
+        score_rows.append(["JAMB-scale score", f"{r['jamb_score']} / 400"])
+    st = Table(score_rows, colWidths=[60 * mm, 60 * mm])
+    st.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#e9f7f0")),
+        ("FONTNAME", (1, 0), (1, -1), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, -1), 11),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#d1efe0")), ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#d1efe0")),
+        ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story += [Paragraph("Overall performance", h), st]
+
+    if data["subjects"]:
+        story.append(Paragraph("Subject breakdown", h))
+        rows = [["Subject", "Score", "Total", "Percentage"]] + [
+            [s["subject"], str(s["score"]), str(s["total_questions"]), f"{round(s['percentage'] or 0)}%"] for s in data["subjects"]
+        ]
+        bt = Table(rows, colWidths=[80 * mm, 25 * mm, 25 * mm, 30 * mm])
+        bt.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f1f3d")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f9fafb")]),
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#e5e7eb")), ("ALIGN", (1, 1), (-1, -1), "CENTER"),
+            ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.append(bt)
+
+    if r["verification_code"]:
+        url = f"{app_url()}/verify_result/{r['verification_code']}"
+        qr = qrcode.make(url)
+        qb = BytesIO()
+        qr.save(qb, format="PNG")
+        qb.seek(0)
+        story += [Spacer(1, 12), Paragraph("Verification", h),
+                  Table([[Image(qb, width=28 * mm, height=28 * mm), Paragraph(f"Scan the QR code or visit<br/><b>{url}</b><br/>to confirm this result slip is genuine.", body)]],
+                        colWidths=[34 * mm, 120 * mm], style=TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))]
+    story += [Spacer(1, 16), Paragraph("This is a practice result generated by PrepNova CBT. It is not an official JAMB, WAEC or university document.", sub)]
+    doc.build(story)
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=f"PrepNova_Result_{r['verification_code'] or r['id']}.pdf", mimetype="application/pdf")
+
+
+# ---------------------------------------------------------------------------
+# Leaderboard
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Growth features: Daily Challenge + Invite friends
+# ---------------------------------------------------------------------------
+
+def _challenge_pick(cur, size):
+    """A short mixed set of curated questions (same quality filter as the landing-page teaser)."""
+    marks = ",".join("?" * len(_TRY_SUBJECTS))
+    rows = cur.execute(
+        f"""SELECT q.id FROM questions_v2 q JOIN subjects s ON s.id = q.subject_id
+            WHERE q.status = 'Active' AND s.subject_name IN ({marks})
+              AND length(q.question_text) BETWEEN 25 AND 260
+              AND length(COALESCE(q.explanation, '')) > 40 AND q.explanation NOT LIKE '%option%is correct%'
+              AND q.question_text NOT LIKE '%passage%' AND q.question_text NOT LIKE '%underlined%' AND q.passage_id IS NULL
+            ORDER BY RANDOM() LIMIT ?""",
+        (*_TRY_SUBJECTS, size),
+    ).fetchall()
+    return [r["id"] for r in rows]
+
+
+@app.route("/challenge", methods=["GET", "POST"])
+@login_required
+@rate_limit(limit=40, window_seconds=600, scope="challenge")
+def daily_challenge():
+    user = session["user"]
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = connect()
+    cur = conn.cursor()
+    row = cur.execute("SELECT * FROM daily_challenge WHERE username = ? AND day = ?", (user, today)).fetchone()
+    if not row:
+        ids = _challenge_pick(cur, CHALLENGE_SIZE)
+        if len(ids) < 3:
+            conn.close()
+            flash("Today's challenge is not ready yet — try a practice session instead.", "info")
+            return redirect(url_for("practice"))
+        cur.execute("INSERT INTO daily_challenge (username, day, question_ids) VALUES (?, ?, ?)", (user, today, json.dumps(ids)))
+        conn.commit()
+        row = cur.execute("SELECT * FROM daily_challenge WHERE username = ? AND day = ?", (user, today)).fetchone()
+    ids = json.loads(row["question_ids"] or "[]")
+    questions = fetch_questions(cur, "questions_v2", ids, with_answers=True)
+    ordered = [questions[i] for i in ids if i in questions]
+    answers = json.loads(row["answers"] or "{}")
+
+    if request.method == "POST" and not row["completed_at"]:
+        answers = {}
+        for q in ordered:
+            pick = (request.form.get(f"q{q['id']}") or "").strip().upper()[:1]
+            if pick in ("A", "B", "C", "D"):
+                answers[str(q["id"])] = pick
+        score = sum(1 for q in ordered if answers.get(str(q["id"])) == q["correct"])
+        for q in ordered:
+            if q.get("topic") and q.get("subject"):
+                study.record_topic_progress(cur, user, "JAMB", q["subject"], q["topic"], answers.get(str(q["id"])) == q["correct"])
+        cur.execute("UPDATE daily_challenge SET answers = ?, score = ?, completed_at = ? WHERE id = ?",
+                    (json.dumps(answers), score, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), row["id"]))
+        conn.commit()
+        row = cur.execute("SELECT * FROM daily_challenge WHERE id = ?", (row["id"],)).fetchone()
+
+    done = bool(row["completed_at"])
+    # How everyone else did today (only when there is real data)
+    agg = cur.execute("SELECT COUNT(*) AS n, AVG(score) AS avg FROM daily_challenge WHERE day = ? AND completed_at IS NOT NULL", (today,)).fetchone()
+    beat_pct = None
+    if done and agg and (agg["n"] or 0) >= 3:
+        below = cur.execute("SELECT COUNT(*) FROM daily_challenge WHERE day = ? AND completed_at IS NOT NULL AND score < ?", (today, row["score"])).fetchone()[0]
+        beat_pct = int(100 * below / agg["n"])
+    streak = study_streak(cur, user)
+    conn.commit()
+    conn.close()
+    if not done:
+        for q in ordered:
+            q.pop("correct", None)
+            q.pop("explanation", None)
+    share = share_text(session.get("name"), "Daily Challenge", f"{row['score']}/{len(ordered)}",
+                       int(100 * (row["score"] or 0) / max(1, len(ordered))), app_url()) if done else None
+    return render_template("challenge.html", questions=ordered, answers=answers, done=done, score=row["score"],
+                           total=len(ordered), streak=streak, beat_pct=beat_pct, players=(agg["n"] if agg else 0), share=share, day=today)
+
+
+@app.route("/invite")
+@login_required
+def invite():
+    conn = connect()
+    cur = conn.cursor()
+    stats = referral_stats(cur, session["user"])
+    conn.commit()
+    conn.close()
+    link = f"{app_url()}/register?ref={stats['code']}" if stats["code"] else f"{app_url()}/register"
+    first = (session.get("name") or "").split()[0] if session.get("name") else "I"
+    msg = (f"{first} is preparing for JAMB on PrepNova CBT — real CBT mocks with step-by-step explanations. "
+           f"Register with my link and we BOTH get {REFERRAL_REWARD_DAYS} free days after your first mock 👉 {link}")
+    return render_template("invite.html", stats=stats, link=link, msg=msg)
+
+
+@app.route("/mistakes")
+@login_required
+def mistakes():
+    conn = connect()
+    cur = conn.cursor()
+    summary = mistakes_summary(cur, session["user"])
+    conn.close()
+    return render_template("mistakes.html", summary=summary)
+
+
+@app.route("/mistakes/fix", methods=["GET", "POST"])
+@app.route("/mistakes/fix/<subject>", methods=["GET", "POST"])
+@login_required
+def fix_mistakes(subject=None):
+    user = session["user"]
+    conn = connect()
+    cur = conn.cursor()
+    key = "fixing"
+    state = session.get(key) or {"fixed": 0, "tried": 0}
+    feedback = None
+
+    if request.method == "POST":
+        qid = request.form.get("question_id", type=int)
+        source = (request.form.get("source") or "questions_v2")[:30]
+        chosen = (request.form.get("answer") or "").strip().upper()
+        q = fetch_questions(cur, source, [qid], with_answers=True).get(qid) if qid else None
+        if not q or chosen not in ("A", "B", "C", "D"):
+            conn.close()
+            flash("Please choose an option.", "warning")
+            return redirect(url_for("fix_mistakes", subject=subject))
+        m_row = cur.execute("SELECT subject FROM mistakes WHERE username = ? AND question_source = ? AND question_id = ?", (user, source, qid)).fetchone()
+        item_subject = (m_row["subject"] if m_row else None) or subject
+        is_correct = chosen == q["correct"]
+        if q.get("topic") and item_subject:
+            study.record_topic_progress(cur, user, "JAMB", item_subject, q["topic"], is_correct)
+        state["tried"] += 1
+        if is_correct:
+            state["fixed"] += 1
+            clear_mistake(cur, user, source, qid)
+        else:
+            record_mistake(cur, user, source, qid)
+        conn.commit()
+        session[key] = state
+        session.modified = True
+        q["source"] = source
+        feedback = {"q": q, "chosen": chosen, "is_correct": is_correct}
+        summary = mistakes_summary(cur, user)
+        conn.close()
+        return render_template("fix_mistakes.html", q=q, feedback=feedback, state=state, subject=subject, summary=summary, item=None)
+
+    params = [user]
+    where = "username = ? AND cleared_at IS NULL"
+    if subject:
+        where += " AND subject = ?"
+        params.append(subject)
+    item = cur.execute(f"SELECT * FROM mistakes WHERE {where} ORDER BY times_wrong DESC, last_wrong_at ASC LIMIT 1", params).fetchone()
+    if not item:
+        conn.close()
+        session.pop(key, None)
+        flash("No mistakes left to fix here — well done! Write a mock or practise to find new ones.", "success")
+        return redirect(url_for("mistakes"))
+    q = fetch_questions(cur, item["question_source"], [item["question_id"]], with_answers=True).get(item["question_id"])
+    if not q:
+        # question was deleted from the bank — clear it and move on
+        cur.execute("UPDATE mistakes SET cleared_at = CURRENT_TIMESTAMP WHERE id = ?", (item["id"],))
+        conn.commit()
+        conn.close()
+        return redirect(url_for("fix_mistakes", subject=subject))
+    summary = mistakes_summary(cur, user)
+    conn.close()
+    q_public = {k: v for k, v in q.items() if k not in ("correct", "explanation")}
+    q_public["source"] = item["question_source"]
+    return render_template("fix_mistakes.html", q=q_public, feedback=None, state=state, subject=subject, summary=summary, item=item)
+
+
+@app.route("/leaderboard")
+@login_required
+def leaderboard():
+    period = request.args.get("period", "month")
+    since = {"week": "-7 days", "month": "-30 days", "all": "-100 years"}.get(period, "-30 days")
+    conn = connect()
+    rows = conn.execute(
+        """
+        SELECT r.username, u.name, COUNT(*) AS exams, ROUND(AVG(r.percentage), 1) AS avg_pct, MAX(r.percentage) AS best
+        FROM results r LEFT JOIN users u ON u.email = r.username
+        WHERE r.date_taken >= datetime('now', ?) AND r.total >= 10
+        GROUP BY r.username ORDER BY avg_pct DESC, exams DESC LIMIT 25
+        """,
+        (since,),
+    ).fetchall()
+    conn.close()
+    me = session["user"]
+    my_rank = next((i for i, r in enumerate(rows, start=1) if r["username"] == me), None)
+    return render_template("leaderboard.html", rows=rows, period=period, me=me, my_rank=my_rank)
+
+
+# ---------------------------------------------------------------------------
+# Subscriptions & Paystack
+# ---------------------------------------------------------------------------
+
+@app.route("/subscribe")
+@login_required
+def subscribe():
+    conn = connect()
+    plans = conn.execute("SELECT id, plan_name, price, duration_days, description FROM subscription_plans WHERE is_active = 1 ORDER BY duration_days").fetchall()
+    sub = get_subscription(session["user"], conn.cursor())
+    conn.close()
+    return render_template("subscribe.html", plans=plans, sub=sub, paystack_ready=bool(PAYSTACK_SECRET_KEY),
+                           pin_open=request.args.get("pin") == "1")
+
+
+@app.route("/redeem_pin", methods=["POST"])
+@login_required
+@rate_limit(limit=8, window_seconds=600, scope="redeem_pin")
+def redeem_pin():
+    conn = connect()
+    cur = conn.cursor()
+    ok, message, _end = redeem_access_code(cur, session["user"], request.form.get("pin") or "")
+    conn.commit()
+    conn.close()
+    flash(message, "success" if ok else "danger")
+    return redirect(url_for("dashboard") if ok else url_for("subscribe", pin=1))
+
+
+@app.route("/set_exam_date", methods=["POST"])
+@login_required
+def set_exam_date():
+    raw = (request.form.get("exam_date") or "").strip()[:10]
+    if raw:
+        try:
+            d = datetime.strptime(raw, "%Y-%m-%d").date()
+        except ValueError:
+            flash("Please pick a valid date.", "warning")
+            return redirect(request.referrer or url_for("study_plan"))
+        if not (datetime.now().date() - timedelta(days=1) <= d <= datetime.now().date() + timedelta(days=730)):
+            flash("Pick a date between today and two years from now.", "warning")
+            return redirect(request.referrer or url_for("study_plan"))
+    conn = connect()
+    conn.execute("UPDATE users SET exam_date = ? WHERE email = ?", (raw or None, session["user"]))
+    conn.commit()
+    conn.close()
+    flash("Exam date saved. Your countdown and weekly plan are updated." if raw else "Exam date cleared.", "success")
+    return redirect(request.referrer or url_for("study_plan"))
+
+
+@app.route("/study_plan")
+@login_required
+def study_plan():
+    conn = connect()
+    cur = conn.cursor()
+    user = session["user"]
+    row = cur.execute("SELECT exam_date, target_score FROM users WHERE email = ?", (user,)).fetchone()
+    plan = study.weekly_plan(cur, user, row["exam_date"] if row else None)
+    coverage = study.syllabus_coverage(cur, user, "JAMB", [x["subject"] for x in plan["subjects"]])
+    conn.close()
+    return render_template("study_plan.html", plan=plan, exam_date=(row["exam_date"] if row else None),
+                           target=(row["target_score"] if row else None), coverage=coverage, today=datetime.now().date())
+
+
+@app.route("/syllabus")
+@app.route("/syllabus/<subject>")
+@login_required
+def syllabus(subject=None):
+    conn = connect()
+    cur = conn.cursor()
+    user = session["user"]
+    subjects = study.student_subjects(cur, user)
+    avail = available_subjects("JAMB")
+    if subject and subject in avail and subject not in subjects:
+        subjects = [subject] + subjects
+    coverage = study.syllabus_coverage(cur, user, "JAMB", subjects)
+    conn.close()
+    if subject and subject not in [c["subject"] for c in coverage]:
+        abort(404)
+    return render_template("syllabus.html", coverage=coverage, focus=subject, all_subjects=sorted(avail))
+
+
+@app.route("/parent_link", methods=["GET", "POST"])
+@login_required
+def parent_link():
+    conn = connect()
+    cur = conn.cursor()
+    if request.method == "POST":
+        code = study.reset_parent_code(cur, session["user"])
+        conn.commit()
+        flash("A new parent link was created. The old link no longer works.", "success")
+    else:
+        code = study.ensure_parent_code(cur, session["user"])
+        conn.commit()
+    email = session["user"]
+    streak = study_streak(cur, email)
+    mocks = cur.execute("SELECT COUNT(*) FROM results WHERE username = ?", (email,)).fetchone()[0]
+    projection = jamb_projection(cur, email)
+    conn.close()
+    link = f"{app_url()}/parent/{code}"
+    first = (session.get("name") or "your child").split(" ")[0]
+    stats = f"So far: {mocks} mock exam{'s' if mocks != 1 else ''} written and a {streak}-day study streak"
+    if projection:
+        stats += f", projected UTME score {projection}/400"
+    wa = ("https://wa.me/?text=" + quote(f"Hello! This is {first}'s PrepNova CBT progress report.\n"
+                                         f"{stats}.\n"
+                                         f"You can follow my preparation live here (no login needed):\n{link}"))
+    return render_template("parent_link.html", code=code, link=link, wa=wa)
+
+
+@app.route("/parent/<code>")
+@rate_limit(60, 600, scope="parent_view", methods=("GET",))
+def parent_view(code):
+    code = code.strip().upper()[:12]
+    conn = connect()
+    cur = conn.cursor()
+    data = study.parent_summary(cur, code)
+    plans = conn.execute("SELECT id, plan_name, price, duration_days FROM subscription_plans WHERE is_active = 1 ORDER BY duration_days").fetchall()
+    conn.close()
+    if not data:
+        abort(404)
+    return render_template("parent_view.html", d=data, code=code, plans=plans, paystack_ready=bool(PAYSTACK_SECRET_KEY))
+
+
+@app.route("/sponsor_payment/<code>/<int:plan_id>", methods=["POST"])
+@rate_limit(limit=10, window_seconds=600, scope="sponsor_pay", methods=("POST",))
+def sponsor_payment(code, plan_id):
+    """A parent/guardian pays for a child's plan from the public progress report (no login).
+
+    The payment row is created against the CHILD's account, so the existing callback logic
+    (_process_paystack_payment → activate_subscription) extends the child's subscription
+    automatically. References carry the PN-S- prefix to mark sponsor payments.
+    """
+    code = code.strip().upper()[:12]
+    if not PAYSTACK_SECRET_KEY:
+        flash("Online payment is not available right now. Please contact support on WhatsApp.", "danger")
+        return redirect(url_for("parent_view", code=code))
+    conn = connect()
+    cur = conn.cursor()
+    child = cur.execute("SELECT email, name FROM users WHERE parent_code = ?", (code,)).fetchone()
+    plan = cur.execute("SELECT id, plan_name, price, duration_days FROM subscription_plans WHERE id = ? AND is_active = 1", (plan_id,)).fetchone()
+    if not child or not plan:
+        conn.close()
+        abort(404)
+    reference = f"PN-S-{int(time.time())}-{secrets.token_hex(6).upper()}"
+    cur.execute(
+        "INSERT INTO payments (username, plan_id, plan_name, amount, duration_days, transaction_reference, payment_status, currency) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', 'NGN')",
+        (child["email"], plan["id"], plan["plan_name"], plan["price"], plan["duration_days"], reference),
+    )
+    conn.commit()
+    conn.close()
+    try:
+        resp = requests.post(
+            "https://api.paystack.co/transaction/initialize",
+            json={
+                "email": child["email"],
+                "amount": int(round(float(plan["price"]) * 100)),
+                "currency": "NGN",
+                "reference": reference,
+                "callback_url": f"{app_url()}/sponsor_callback",
+                "metadata": {"plan_id": plan["id"], "plan_name": plan["plan_name"], "username": child["email"],
+                             "sponsor": 1,
+                             "custom_fields": [{"display_name": "Plan", "variable_name": "plan", "value": plan["plan_name"]}]},
+            },
+            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        log.exception("Paystack initialise failed (sponsor)")
+        flash("We could not reach Paystack. Please check your connection and try again.", "danger")
+        return redirect(url_for("parent_view", code=code))
+    if resp.status_code != 200 or not payload.get("status"):
+        log.error("Paystack init error (sponsor): %s", payload)
+        flash("Payment could not be started. Please try again or contact support.", "danger")
+        return redirect(url_for("parent_view", code=code))
+    return redirect(payload["data"]["authorization_url"])
+
+
+@app.route("/sponsor_callback")
+def sponsor_callback():
+    """Paystack returns a sponsoring parent here after payment — public thank-you page."""
+    reference = (request.args.get("reference") or request.args.get("trxref") or "").strip()[:64]
+    if not reference or not PAYSTACK_SECRET_KEY:
+        flash("Payment reference missing.", "danger")
+        return redirect(url_for("home"))
+    try:
+        resp = requests.get(f"https://api.paystack.co/transaction/verify/{reference}", headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"}, timeout=30)
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        log.exception("Paystack verify failed (sponsor)")
+        flash("We could not verify the payment right now. If you were debited, the plan will be activated automatically shortly.", "warning")
+        return redirect(url_for("home"))
+    if resp.status_code != 200 or not payload.get("status"):
+        flash("Payment verification failed. If you were debited, contact support with the reference.", "danger")
+        return redirect(url_for("home"))
+    ok, msg = _process_paystack_payment(reference, payload.get("data") or {})
+    conn = connect()
+    row = conn.execute(
+        "SELECT p.payment_status, p.plan_name, u.name, u.parent_code FROM payments p JOIN users u ON u.email = p.username WHERE p.transaction_reference = ?",
+        (reference,),
+    ).fetchone()
+    conn.close()
+    if ok and row:
+        first = (row["name"] or "your child").split(" ")[0]
+        return render_template("sponsor_thanks.html", first=first, plan=row["plan_name"], code=row["parent_code"])
+    flash(msg or "The payment did not go through.", "danger")
+    if row and row["parent_code"]:
+        return redirect(url_for("parent_view", code=row["parent_code"]))
+    return redirect(url_for("home"))
+
+
+# ---------------------------------------------------------------------------
+# Saturday Live Mock
+# ---------------------------------------------------------------------------
+
+@app.route("/live")
+@login_required
+def live_mock():
+    conn = connect()
+    cur = conn.cursor()
+    user = session["user"]
+    row, win = study.current_live_mock(cur)
+    mine = study.my_live_attempt(cur, user, row["id"]) if row else None
+    board = study.live_leaderboard(cur, row["id"]) if row else []
+    # last week's board for the "how it went" section
+    prev = cur.execute("SELECT * FROM live_mocks WHERE week_key < ? ORDER BY week_key DESC LIMIT 1", (win["week_key"],)).fetchone()
+    prev_board = study.live_leaderboard(cur, prev["id"], 10) if prev else []
+    prev_mine = study.my_live_attempt(cur, user, prev["id"]) if prev else None
+    subjects = study.student_subjects(cur, user)
+    players = cur.execute("SELECT COUNT(DISTINCT username) FROM exam_attempts WHERE live_id = ?", (row["id"],)).fetchone()[0] if row else 0
+    conn.close()
+    my_rank = next((i for i, r in enumerate(board, start=1) if r["username"] == user), None)
+    return render_template("live_mock.html", win=win, live=row, mine=mine, board=board, my_rank=my_rank, prev=prev,
+                           prev_board=prev_board, prev_mine=prev_mine, subjects=subjects, players=players, me=user,
+                           electives=[s_ for s_ in JAMB_ELECTIVES if s_ in available_subjects("JAMB")], now=study.lagos_now())
+
+
+@app.route("/live/start", methods=["POST"])
+@login_required
+def live_start():
+    user = session["user"]
+    conn = connect()
+    cur = conn.cursor()
+    row, win = study.current_live_mock(cur, create=True)
+    conn.commit()
+    if win["state"] != "open":
+        conn.close()
+        flash(f"The Live Mock opens on Saturday {win['saturday'].strftime('%d %b')} at {win['opens_at'].strftime('%I:%M %p').lstrip('0')}.", "info")
+        return redirect(url_for("live_mock"))
+    mine = study.my_live_attempt(cur, user, row["id"])
+    conn.close()
+    if mine and mine["status"] == "IN_PROGRESS":
+        return redirect(url_for("exam_room", attempt_id=mine["id"]))
+    if mine:
+        flash("You have already written this week's Live Mock. See your rank below.", "info")
+        return redirect(url_for("live_mock"))
+    if (r := _require_subscription()):
+        return r
+    if request.form.get("discard") != "1" and engine.get_open_attempt(user):
+        flash("You already have an exam in progress. Resume it below, or discard it to start the Live Mock.", "warning")
+        return redirect(url_for("exam_types"))
+    picked = []
+    for s_ in request.form.getlist("subjects"):
+        if s_ in JAMB_ELECTIVES and s_ not in picked:
+            picked.append(s_)
+    if len(picked) != 3:
+        flash("Choose exactly three subjects to go with Use of English.", "warning")
+        return redirect(url_for("live_mock"))
+    try:
+        attempt_id = engine.create_live_attempt(user, row["id"], ["Use of English"] + picked, client_ip(), request.headers.get("User-Agent"))
+    except engine.ExamError as e:
+        flash(str(e), "danger")
+        return redirect(url_for("live_mock"))
+    return redirect(url_for("exam_room", attempt_id=attempt_id))
+
+
+@app.route("/set_target", methods=["POST"])
+@login_required
+def set_target():
+    try:
+        target = int(request.form.get("target") or 0)
+    except ValueError:
+        target = 0
+    if not 100 <= target <= 400:
+        flash("Pick a target between 100 and 400.", "warning")
+        return redirect(url_for("dashboard"))
+    conn = connect()
+    conn.execute("UPDATE users SET target_score = ? WHERE email = ?", (target, session["user"]))
+    conn.commit()
+    conn.close()
+    flash(f"Target set: {target}/400. We will show your progress towards it after every mock.", "success")
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/subscription")
+@login_required
+def subscription_alias():
+    return redirect(url_for("subscribe"))
+
+
+@app.route("/subscribe_plan/<int:plan_id>")
+@login_required
+def subscribe_plan(plan_id):
+    conn = connect()
+    plan = conn.execute("SELECT id, plan_name, price, duration_days, description FROM subscription_plans WHERE id = ? AND is_active = 1", (plan_id,)).fetchone()
+    user = conn.execute("SELECT name, email, phone FROM users WHERE email = ?", (session["user"],)).fetchone()
+    sub = get_subscription(session["user"], conn.cursor())
+    conn.close()
+    if not plan:
+        abort(404)
+    return render_template("subscription_summary.html", plan=plan, user=user, sub=sub, paystack_ready=bool(PAYSTACK_SECRET_KEY))
+
+
+@app.route("/initialize_payment/<int:plan_id>", methods=["POST"])
+@login_required
+@rate_limit(limit=10, window_seconds=600, scope="pay_init")
+def initialize_payment(plan_id):
+    if not PAYSTACK_SECRET_KEY:
+        flash("Online payment is not configured yet. Please contact support.", "danger")
+        return redirect(url_for("subscribe"))
+    conn = connect()
+    cur = conn.cursor()
+    plan = cur.execute("SELECT id, plan_name, price, duration_days FROM subscription_plans WHERE id = ? AND is_active = 1", (plan_id,)).fetchone()
+    if not plan:
+        conn.close()
+        abort(404)
+    reference = f"PN-{int(time.time())}-{secrets.token_hex(6).upper()}"
+    amount = float(plan["price"])
+    promo_code = (request.form.get("promo_code") or "").strip().upper()[:24]
+    if promo_code:
+        promo, pmsg = _validate_promo(cur, promo_code, plan["price"], "plans")
+        if not promo:
+            conn.close()
+            flash(pmsg, "danger")
+            return redirect(url_for("subscribe_plan", plan_id=plan_id))
+        amount = max(100.0, round(plan["price"] - _promo_discount(promo, plan["price"]), 2))
+    renew_intent = 1 if request.form.get("auto_renew") == "on" else 0
+    cur.execute(
+        "INSERT INTO payments (username, plan_id, plan_name, amount, duration_days, transaction_reference, payment_status, currency, ref_code, promo_code, renew_intent) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', 'NGN', ?, ?, ?)",
+        (session["user"], plan["id"], plan["plan_name"], amount, plan["duration_days"], reference,
+         (request.cookies.get("pn_ref") or "").strip().upper()[:16], promo_code or None, renew_intent),
+    )
+    conn.commit()
+    conn.close()
+    try:
+        resp = requests.post(
+            "https://api.paystack.co/transaction/initialize",
+            json={
+                "email": session["user"],
+                "amount": int(round(amount * 100)),
+                "currency": "NGN",
+                "reference": reference,
+                "callback_url": f"{app_url()}/payment_callback",
+                "metadata": {"plan_id": plan["id"], "plan_name": plan["plan_name"], "username": session["user"],
+                             "custom_fields": [{"display_name": "Plan", "variable_name": "plan", "value": plan["plan_name"]}]},
+            },
+            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        log.exception("Paystack initialise failed")
+        flash("We could not reach Paystack. Please check your connection and try again.", "danger")
+        return redirect(url_for("subscribe"))
+    if resp.status_code != 200 or not payload.get("status"):
+        log.error("Paystack init error: %s", payload)
+        flash("Payment could not be started. Please try again or contact support.", "danger")
+        return redirect(url_for("subscribe"))
+    return redirect(payload["data"]["authorization_url"])
+
+
+def _process_paystack_payment(reference, payment_data):
+    """Verify amount/currency against our pending record, mark paid and extend the subscription. Idempotent."""
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        record = cur.execute("SELECT * FROM payments WHERE transaction_reference = ?", (reference,)).fetchone()
+        if not record:
+            return False, "Payment record not found."
+        if record["payment_status"] == "SUCCESS":
+            return True, "already"
+        if payment_data.get("status") != "success":
+            cur.execute("UPDATE payments SET payment_status = ?, gateway_response = ? WHERE transaction_reference = ?",
+                        (str(payment_data.get("status", "FAILED")).upper()[:20], str(payment_data.get("gateway_response"))[:200], reference))
+            conn.commit()
+            return False, "Payment was not successful."
+        paid_kobo = int(payment_data.get("amount") or 0)
+        expected_kobo = int(round(float(record["amount"]) * 100))
+        if paid_kobo < expected_kobo or (payment_data.get("currency") or "NGN") != "NGN":
+            log.warning("Paystack amount mismatch for %s: paid=%s expected=%s", reference, paid_kobo, expected_kobo)
+            cur.execute("UPDATE payments SET payment_status = 'AMOUNT_MISMATCH', gateway_response = ? WHERE transaction_reference = ?",
+                        (f"paid {paid_kobo} expected {expected_kobo}", reference))
+            conn.commit()
+            return False, "Payment amount did not match the selected plan. Please contact support."
+        cur.execute(
+            """
+            UPDATE payments SET payment_status = 'SUCCESS', paystack_reference = ?, gateway_response = ?, payment_method = ?, channel = ?,
+                                currency = ?, amount_verified = ?, verified_at = CURRENT_TIMESTAMP, paid_at = CURRENT_TIMESTAMP
+            WHERE transaction_reference = ?
+            """,
+            (payment_data.get("reference"), str(payment_data.get("gateway_response"))[:200], payment_data.get("channel"),
+             payment_data.get("channel"), payment_data.get("currency"), paid_kobo / 100.0, reference),
+        )
+        start, end = activate_subscription(cur, record["username"], record["plan_id"], record["plan_name"], record["duration_days"],
+                                            record["amount"], "NGN", reference)
+        student = cur.execute("SELECT name FROM users WHERE email = ?", (record["username"],)).fetchone()
+        _paid = cur.execute("SELECT * FROM payments WHERE transaction_reference = ?", (reference,)).fetchone()
+        _maybe_credit_partner(cur, _paid)
+        _maybe_enable_auto_renew(cur, _paid, payment_data)
+        _record_promo_use(cur, _paid)
+        conn.commit()
+        name = student["name"] if student else "Student"
+        body = (f"Hello {name},\n\nYour payment of {fmt_naira(record['amount'])} for the {record['plan_name']} plan was successful.\n\n"
+                f"Reference: {reference}\nActive from: {start:%d %B %Y}\nExpires: {end:%d %B %Y}\n\nThank you for choosing PrepNova CBT.")
+        html = email_wrap("Payment confirmed",
+                          f"Hello <b>{name}</b>,<br><br>Your <b>{record['plan_name']}</b> plan is now active.<br>"
+                          f"Amount: <b>{fmt_naira(record['amount'])}</b><br>Reference: <b>{reference}</b><br>Expires: <b>{end:%d %B %Y}</b>",
+                          "Go to my dashboard", f"{app_url()}/dashboard")
+        send_email("PrepNova CBT — payment confirmed", record["username"], body, html)
+        return True, "ok"
+    finally:
+        conn.close()
+
+
+@app.route("/payment_callback")
+def payment_callback():
+    reference = (request.args.get("reference") or request.args.get("trxref") or "").strip()[:64]
+    if not reference or not PAYSTACK_SECRET_KEY:
+        flash("Payment reference missing.", "danger")
+        return redirect(url_for("subscribe"))
+    try:
+        resp = requests.get(f"https://api.paystack.co/transaction/verify/{reference}", headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"}, timeout=30)
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        log.exception("Paystack verify failed")
+        flash("We could not verify your payment right now. If you were debited, your plan will be activated automatically shortly.", "warning")
+        return redirect(url_for("subscribe"))
+    if resp.status_code != 200 or not payload.get("status"):
+        flash("Payment verification failed. If you were debited, contact support with your reference.", "danger")
+        return redirect(url_for("subscribe"))
+    ok, msg = _process_paystack_payment(reference, payload.get("data") or {})
+    if ok:
+        flash("Payment successful — your subscription is now active. Happy practising!", "success")
+        return redirect(url_for("dashboard"))
+    flash(msg, "danger")
+    return redirect(url_for("subscribe"))
+
+
+@app.route("/paystack/webhook", methods=["POST"])
+def paystack_webhook():
+    """Server-to-server confirmation from Paystack (works even if the student closes the browser)."""
+    if not PAYSTACK_SECRET_KEY:
+        abort(404)
+    signature = request.headers.get("X-Paystack-Signature", "")
+    digest = hmac.new(PAYSTACK_SECRET_KEY.encode(), request.get_data(), hashlib.sha512).hexdigest()
+    if not hmac.compare_digest(signature, digest):
+        abort(401)
+    event = request.get_json(silent=True) or {}
+    if event.get("event") == "charge.success":
+        data = event.get("data") or {}
+        reference = (data.get("reference") or "")[:64]
+        if reference:
+            if reference.startswith("PN-G-"):
+                _fulfil_gift(reference, data)
+            elif reference.startswith("PN-FAM-"):
+                _fulfil_family(reference, data)
+            elif reference.startswith("PN-SC-"):
+                _fulfil_sponsor(reference, data)
+            elif reference.startswith("PN-A-"):
+                _fulfil_agent(reference, data)
+            elif reference.startswith("PN-P-"):
+                _fulfil_pdf(reference, data)
+            elif reference.startswith("PN-RN-"):
+                _fulfil_renewal(reference, data)
+            else:
+                _process_paystack_payment(reference, data)
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Gift a subscription (public — buy full access for someone, no login needed)
+# ---------------------------------------------------------------------------
+
+GIFT_CODE_VALID_DAYS = 180  # how long an unredeemed gift PIN stays valid
+
+
+@app.route("/gift")
+def gift_page():
+    conn = connect()
+    plans = conn.execute(
+        "SELECT id, plan_name, price, duration_days, description FROM subscription_plans WHERE is_active = 1 ORDER BY duration_days"
+    ).fetchall()
+    conn.close()
+    return render_template("gift.html", plans=plans, paystack_ready=bool(PAYSTACK_SECRET_KEY))
+
+
+@app.route("/gift_start", methods=["POST"])
+@rate_limit(limit=10, window_seconds=600, scope="gift_start")
+def gift_start():
+    """Create a pending gift purchase and hand the buyer to Paystack (no account needed)."""
+    if not PAYSTACK_SECRET_KEY:
+        flash("Online payment is not available right now. Please contact support on WhatsApp.", "danger")
+        return redirect(url_for("gift_page"))
+    form = request.form
+    buyer_name = re.sub(r"\s+", " ", form.get("buyer_name") or "").strip()[:60]
+    buyer_email = (form.get("buyer_email") or "").strip().lower()[:80]
+    recipient_name = re.sub(r"\s+", " ", form.get("recipient_name") or "").strip()[:40]
+    message = re.sub(r"\s+", " ", form.get("message") or "").strip()[:140]
+    if len(buyer_name) < 2:
+        flash("Please enter your name.", "danger")
+        return redirect(url_for("gift_page"))
+    if not valid_email(buyer_email):
+        flash("Please enter a valid email address — a copy of the gift PIN is sent there.", "danger")
+        return redirect(url_for("gift_page"))
+    try:
+        plan_id = int(form.get("plan_id") or 0)
+    except (TypeError, ValueError):
+        plan_id = 0
+    conn = connect()
+    cur = conn.cursor()
+    plan = cur.execute(
+        "SELECT id, plan_name, price, duration_days FROM subscription_plans WHERE id = ? AND is_active = 1", (plan_id,)
+    ).fetchone()
+    if not plan:
+        conn.close()
+        flash("Please choose a plan.", "danger")
+        return redirect(url_for("gift_page"))
+    reference = f"PN-G-{int(time.time())}-{secrets.token_hex(6).upper()}"
+    cur.execute(
+        """INSERT INTO gift_purchases (buyer_name, buyer_email, recipient_name, message, plan_id, plan_name,
+                                       amount, duration_days, transaction_reference, payment_status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')""",
+        (buyer_name, buyer_email, recipient_name, message, plan["id"], plan["plan_name"],
+         plan["price"], plan["duration_days"], reference),
+    )
+    conn.commit()
+    conn.close()
+    try:
+        resp = requests.post(
+            "https://api.paystack.co/transaction/initialize",
+            json={
+                "email": buyer_email,
+                "amount": int(round(float(plan["price"]) * 100)),
+                "currency": "NGN",
+                "reference": reference,
+                "callback_url": f"{app_url()}/gift_callback",
+                "metadata": {"gift": 1, "plan_id": plan["id"], "plan_name": plan["plan_name"],
+                             "custom_fields": [{"display_name": "Gift", "variable_name": "gift", "value": plan["plan_name"]}]},
+            },
+            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        log.exception("Paystack initialise failed (gift)")
+        flash("We could not reach Paystack. Please check your connection and try again.", "danger")
+        return redirect(url_for("gift_page"))
+    if resp.status_code != 200 or not payload.get("status"):
+        log.error("Paystack init error (gift): %s", payload)
+        flash("Payment could not be started. Please try again or contact support.", "danger")
+        return redirect(url_for("gift_page"))
+    return redirect(payload["data"]["authorization_url"])
+
+
+def _fulfil_gift(reference, payment_data):
+    """Verify a gift payment, mark it paid and mint the gift Access PIN. Idempotent."""
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        row = cur.execute("SELECT * FROM gift_purchases WHERE transaction_reference = ?", (reference,)).fetchone()
+        if not row:
+            return False, "Gift record not found.", None
+        if row["payment_status"] == "PAID":
+            return True, "already", row["code_text"]
+        if payment_data.get("status") != "success":
+            cur.execute("UPDATE gift_purchases SET payment_status = 'FAILED' WHERE id = ?", (row["id"],))
+            conn.commit()
+            return False, "Payment was not successful.", None
+        paid_kobo = int(payment_data.get("amount") or 0)
+        expected_kobo = int(round(float(row["amount"]) * 100))
+        if paid_kobo < expected_kobo or (payment_data.get("currency") or "NGN") != "NGN":
+            log.warning("Paystack amount mismatch (gift) for %s: paid=%s expected=%s", reference, paid_kobo, expected_kobo)
+            cur.execute("UPDATE gift_purchases SET payment_status = 'AMOUNT_MISMATCH' WHERE id = ?", (row["id"],))
+            conn.commit()
+            return False, "Payment amount did not match the selected plan. Please contact support.", None
+        expires = (datetime.now() + timedelta(days=GIFT_CODE_VALID_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+        code = generate_access_codes(cur, 1, row["duration_days"], f"Gift — {row['plan_name']}", 1, expires,
+                                     f"GIFT:{row['buyer_email']}")[0]
+        cur.execute("UPDATE gift_purchases SET payment_status = 'PAID', code_text = ?, paid_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (code, row["id"]))
+        conn.commit()
+        if mail_configured():
+            try:
+                pretty = pretty_code(code)
+                send_email("PrepNova CBT — your gift PIN",
+                           row["buyer_email"],
+                           (f"Hello {row['buyer_name']},\n\nThank you for gifting the {row['plan_name']} plan.\n\n"
+                            f"Gift PIN: {pretty}\nValid until: {expires}\nReference: {reference}\n\n"
+                            f"Send the PIN to {row['recipient_name'] or 'the student'} — they enter it under Subscribe -> 'Have an Access PIN'."),
+                           email_wrap("Your gift is ready",
+                                      (f"Hello <b>{row['buyer_name']}</b>,<br><br>Thank you for gifting the <b>{row['plan_name']}</b> plan."
+                                       f"<br><br>Gift PIN: <b style='font-size:1.3rem'>{pretty}</b><br>Valid until: <b>{expires}</b><br>"
+                                       f"Reference: <b>{reference}</b>"),
+                                      "Open PrepNova", f"{app_url()}"))
+            except Exception:
+                log.exception("Gift receipt email failed")
+        return True, "ok", code
+    finally:
+        conn.close()
+
+
+@app.route("/gift_callback")
+def gift_callback():
+    """Paystack returns the buyer here — show the gift PIN and how to share it."""
+    reference = (request.args.get("reference") or request.args.get("trxref") or "").strip()[:64]
+    if not reference or not PAYSTACK_SECRET_KEY:
+        flash("Payment reference missing.", "danger")
+        return redirect(url_for("gift_page"))
+    try:
+        resp = requests.get(f"https://api.paystack.co/transaction/verify/{reference}",
+                            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"}, timeout=30)
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        log.exception("Paystack verify failed (gift)")
+        flash("We could not verify your payment right now. If you were debited, your gift PIN will be emailed to you shortly.", "warning")
+        return redirect(url_for("gift_page"))
+    if resp.status_code != 200 or not payload.get("status"):
+        flash("Payment verification failed. If you were debited, contact support with your reference.", "danger")
+        return redirect(url_for("gift_page"))
+    ok, msg, code = _fulfil_gift(reference, payload.get("data") or {})
+    if not ok:
+        flash(msg, "danger")
+        return redirect(url_for("gift_page"))
+    conn = connect()
+    row = conn.execute("SELECT * FROM gift_purchases WHERE transaction_reference = ?", (reference,)).fetchone()
+    expires_row = conn.execute("SELECT expires_at FROM access_codes WHERE code = ?", (code,)).fetchone()
+    conn.close()
+    expires = ""
+    if expires_row and expires_row["expires_at"]:
+        try:
+            expires = datetime.strptime(expires_row["expires_at"], "%Y-%m-%d %H:%M:%S").strftime("%d %B %Y")
+        except ValueError:
+            expires = expires_row["expires_at"]
+    pretty = pretty_code(code)
+    who = f", {row['recipient_name']}" if row["recipient_name"] else ""
+    tail = f" — {row['message']}" if row["message"] else ""
+    share = (f"Your PrepNova CBT gift is ready{who}! Access PIN: {pretty}. "
+             f"Log in at {app_url()} -> Subscribe -> 'Have an Access PIN' "
+             f"to unlock {row['duration_days']} days of full mock exams.{tail}")
+    return render_template("gift_success.html", row=row, code=pretty, expires=expires,
+                           emailed=mail_configured(), share=share, site_url=app_url())
+
+
+# ---------------------------------------------------------------------------
+# Family plan (public — one parent payment, one Access PIN per child)
+# ---------------------------------------------------------------------------
+
+FAMILY_SEATS = 3                  # one PIN per child
+FAMILY_PIN_VALID_DAYS = 180       # unredeemed PINs stay valid this long (like gifts)
+FAMILY_PLANS = [                  # (key, plan name, days, price) — 3 children, saves 17-25%
+    ("monthly", "Family Monthly", 30, 2500.0),
+    ("quarterly", "Family Quarterly", 90, 6000.0),
+    ("yearly", "Family Yearly", 365, 18000.0),
+]
+
+
+def _family_plan_by_key(key):
+    for tpl in FAMILY_PLANS:
+        if tpl[0] == key:
+            return tpl
+    return None
+
+
+def _family_plan_id(cur):
+    """Hidden subscription_plans row for family orders (payments.plan_id is NOT NULL)."""
+    row = cur.execute("SELECT id FROM subscription_plans WHERE plan_name = 'Family plans (internal)'").fetchone()
+    if row:
+        return row["id"]
+    cur.execute("INSERT INTO subscription_plans (plan_name, price, duration_days, description, is_active) "
+                "VALUES ('Family plans (internal)', 0, 30, 'Internal row for Family plan orders', 0)")
+    return cur.execute("SELECT id FROM subscription_plans WHERE plan_name = 'Family plans (internal)'").fetchone()["id"]
+
+
+@app.route("/family")
+def family_page():
+    conn = connect()
+    individual = {}
+    for r in conn.execute("SELECT plan_name, price, duration_days FROM subscription_plans "
+                          "WHERE is_active = 1 AND plan_name IN ('Monthly','Quarterly','Yearly')").fetchall():
+        individual[r["duration_days"]] = r["price"]
+    conn.close()
+    plans = []
+    for key, name, days, price in FAMILY_PLANS:
+        separate = individual.get(days, 0) * FAMILY_SEATS
+        if separate <= 0:
+            separate = price * 1.2 * FAMILY_SEATS  # fallback if individual plans change
+        monthly = round(price / (days / 30.0))
+        plans.append({"key": key, "name": name, "days": days, "price": price,
+                      "separate": separate, "save": separate - price,
+                      "save_pct": round(100 * (separate - price) / separate) if separate else 0,
+                      "monthly": monthly})
+    return render_template("family.html", plans=plans, seats=FAMILY_SEATS,
+                           paystack_ready=bool(PAYSTACK_SECRET_KEY))
+
+
+@app.route("/family_start", methods=["POST"])
+@rate_limit(limit=10, window_seconds=600, scope="family_start")
+def family_start():
+    """Guest checkout for the family plan — parents don't need an account."""
+    if not PAYSTACK_SECRET_KEY:
+        flash("Online payment is not available right now. Please contact support on WhatsApp.", "danger")
+        return redirect(url_for("family_page"))
+    plan = _family_plan_by_key((request.form.get("plan") or "").strip()[:20])
+    buyer_name = re.sub(r"\s+", " ", request.form.get("buyer_name") or "").strip()[:60]
+    buyer_email = (request.form.get("buyer_email") or "").strip().lower()[:80]
+    if not plan:
+        flash("Please choose a family plan.", "danger")
+        return redirect(url_for("family_page"))
+    if len(buyer_name) < 2:
+        flash("Please enter your name.", "danger")
+        return redirect(url_for("family_page"))
+    if not valid_email(buyer_email):
+        flash("Please enter a valid email address — your children's PINs are sent there.", "danger")
+        return redirect(url_for("family_page"))
+    conn = connect()
+    cur = conn.cursor()
+    reference = f"PN-FAM-{int(time.time())}-{secrets.token_hex(6).upper()}"
+    cur.execute(
+        "INSERT INTO family_purchases (reference, buyer_name, buyer_email, plan_name, days, seats, amount, payment_status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')",
+        (reference, buyer_name, buyer_email, plan[1], plan[2], FAMILY_SEATS, plan[3]))
+    cur.execute(
+        "INSERT INTO payments (username, plan_id, plan_name, amount, duration_days, transaction_reference, payment_status, currency, ref_code) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'PENDING', 'NGN', ?)",
+        (buyer_email, _family_plan_id(cur), f"Family — {plan[1]}"[:120], plan[3], plan[2], reference,
+         (request.cookies.get("pn_ref") or "").strip().upper()[:16]))
+    conn.commit()
+    conn.close()
+    try:
+        resp = requests.post(
+            "https://api.paystack.co/transaction/initialize",
+            json={
+                "email": buyer_email,
+                "amount": int(round(plan[3] * 100)),
+                "currency": "NGN",
+                "reference": reference,
+                "callback_url": f"{app_url()}/family_callback",
+                "metadata": {"family": 1, "plan": plan[0], "seats": FAMILY_SEATS,
+                             "custom_fields": [{"display_name": "Plan", "variable_name": "plan",
+                                                "value": plan[1][:100]}]},
+            },
+            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        log.exception("Paystack initialise failed (family plan)")
+        flash("We could not reach Paystack. Please check your connection and try again.", "danger")
+        return redirect(url_for("family_page"))
+    if resp.status_code != 200 or not payload.get("status"):
+        log.error("Paystack init error (family): %s", payload)
+        flash("Payment could not be started. Please try again or contact support.", "danger")
+        return redirect(url_for("family_page"))
+    return redirect(payload["data"]["authorization_url"])
+
+
+def _fulfil_family(reference, payment_data):
+    """Verify a family order, mint one PIN per child, mint the status key. Idempotent."""
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        row = cur.execute("SELECT * FROM family_purchases WHERE reference = ?", (reference,)).fetchone()
+        if not row:
+            return False, "Order not found.", None
+        if row["payment_status"] == "PAID":
+            return True, "already", row
+        if payment_data.get("status") != "success":
+            cur.execute("UPDATE family_purchases SET payment_status = 'FAILED' WHERE id = ?", (row["id"],))
+            cur.execute("UPDATE payments SET payment_status = 'FAILED' WHERE transaction_reference = ?", (reference,))
+            conn.commit()
+            return False, "Payment was not successful.", None
+        paid_kobo = int(payment_data.get("amount") or 0)
+        expected_kobo = int(round(float(row["amount"]) * 100))
+        if paid_kobo < expected_kobo or (payment_data.get("currency") or "NGN") != "NGN":
+            log.warning("Paystack amount mismatch (family) %s: paid=%s expected=%s", reference, paid_kobo, expected_kobo)
+            cur.execute("UPDATE family_purchases SET payment_status = 'AMOUNT_MISMATCH' WHERE id = ?", (row["id"],))
+            cur.execute("UPDATE payments SET payment_status = 'AMOUNT_MISMATCH' WHERE transaction_reference = ?", (reference,))
+            conn.commit()
+            return False, "Payment amount did not match your order. Please contact support.", None
+        expires = (datetime.now() + timedelta(days=FAMILY_PIN_VALID_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+        label = "Family plan ({})".format(row["plan_name"].replace("Family ", ""))
+        codes = generate_access_codes(cur, int(row["seats"]), int(row["days"]), label,
+                                      max_uses=1, expires_at=expires,
+                                      created_by=f"FAMILY:{row['buyer_email']}")
+        if len(codes) != int(row["seats"]):
+            raise RuntimeError(f"only {len(codes)}/{row['seats']} family PINs minted")
+        family_key = secrets.token_hex(10).upper()
+        cur.execute(
+            """UPDATE payments SET payment_status = 'SUCCESS', paystack_reference = ?, gateway_response = ?, payment_method = ?,
+                                  channel = ?, currency = ?, amount_verified = ?, verified_at = CURRENT_TIMESTAMP, paid_at = CURRENT_TIMESTAMP
+               WHERE transaction_reference = ?""",
+            (payment_data.get("reference"), str(payment_data.get("gateway_response"))[:200], payment_data.get("channel"),
+             payment_data.get("channel"), payment_data.get("currency"), paid_kobo / 100.0, reference))
+        cur.execute("UPDATE family_purchases SET payment_status = 'PAID', pins = ?, family_key = ?, paid_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (json.dumps(codes), family_key, row["id"]))
+        _fam_pay = cur.execute("SELECT * FROM payments WHERE transaction_reference = ?", (reference,)).fetchone()
+        _maybe_credit_partner(cur, _fam_pay)
+        _record_promo_use(cur, _fam_pay)
+        conn.commit()
+        row = cur.execute("SELECT * FROM family_purchases WHERE id = ?", (row["id"],)).fetchone()
+        if mail_configured():
+            status_url = f"{app_url()}/family/status/{family_key}"
+            pin_lines = "\n".join(f"  {i + 1}. {c}" for i, c in enumerate(json.loads(row["pins"])))
+            try:
+                send_email("PrepNova CBT — your 3 family PINs are ready",
+                           row["buyer_email"],
+                           (f"Hello {row['buyer_name']},\n\nThank you for the {row['plan_name']} "
+                            f"({row['seats']} children, {row['days']} days each).\n\n"
+                            f"Your children's Access PINs (each works once, on one account):\n{pin_lines}\n\n"
+                            f"Each child: register free at {app_url()}, then Subscribe -> 'Have an Access PIN'.\n"
+                            f"Track redemptions any time: {status_url}\n\nReference: {reference}"),
+                           email_wrap("Your 3 family PINs are ready",
+                                      (f"Hello <b>{row['buyer_name']}</b>,<br><br>Thank you for the "
+                                       f"<b>{row['plan_name']}</b> — {row['seats']} children, "
+                                       f"{row['days']} days each.<br><br>"
+                                       f"Each child registers free at {app_url()} and enters their PIN under "
+                                       f"Subscribe &rarr; 'Have an Access PIN'.<br><br>"
+                                       f"<a href='{status_url}'>Track your PINs here</a>."),
+                                      "Open PrepNova", f"{app_url()}/family"))
+            except Exception:
+                log.exception("Family receipt email failed")
+        return True, "ok", row
+    finally:
+        conn.close()
+
+
+@app.route("/family_callback")
+def family_callback():
+    """Paystack returns the parent here — the PINs page."""
+    reference = (request.args.get("reference") or request.args.get("trxref") or "").strip()[:64]
+    if not reference or not PAYSTACK_SECRET_KEY:
+        flash("Payment reference missing.", "danger")
+        return redirect(url_for("family_page"))
+    try:
+        resp = requests.get(f"https://api.paystack.co/transaction/verify/{reference}",
+                            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"}, timeout=30)
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        log.exception("Paystack verify failed (family)")
+        flash("We could not verify your payment right now. If you were debited, your PINs will be emailed to you shortly.", "warning")
+        return redirect(url_for("family_page"))
+    if resp.status_code != 200 or not payload.get("status"):
+        flash("Payment verification failed. If you were debited, contact support with your reference.", "danger")
+        return redirect(url_for("family_page"))
+    ok, msg, row = _fulfil_family(reference, payload.get("data") or {})
+    if not ok:
+        flash(msg, "danger")
+        return redirect(url_for("family_page"))
+    return render_template("family_success.html", row=row,
+                           pins=[pretty_code(c) for c in json.loads(row["pins"] or "[]")],
+                           status_url=f"{app_url()}/family/status/{row['family_key']}",
+                           pin_days_valid=FAMILY_PIN_VALID_DAYS)
+
+
+@app.route("/family/status/<key>")
+def family_status(key):
+    """The parent's PIN tracker — who has redeemed, who hasn't (key is unguessable)."""
+    key = (key or "").strip().upper()[:40]
+    conn = connect()
+    row = conn.execute("SELECT * FROM family_purchases WHERE family_key = ? AND payment_status = 'PAID'",
+                       (key,)).fetchone()
+    if not row:
+        conn.close()
+        abort(404)
+    pins = json.loads(row["pins"] or "[]")
+    status = []
+    for code in pins:
+        ac = conn.execute("SELECT uses, max_uses, expires_at, days FROM access_codes WHERE code = ?", (code,)).fetchone()
+        redeemed_by, redeemed_at = None, None
+        if ac and ac["uses"] >= 1:
+            red = conn.execute("SELECT username, redeemed_at FROM access_code_redemptions WHERE code_id = "
+                               "(SELECT id FROM access_codes WHERE code = ?) ORDER BY id DESC LIMIT 1", (code,)).fetchone()
+            if red:
+                redeemed_by, redeemed_at = red["username"], red["redeemed_at"]
+        status.append({"code": pretty_code(code), "redeemed_by": redeemed_by, "redeemed_at": redeemed_at,
+                       "expires_at": ac["expires_at"] if ac else None, "days": ac["days"] if ac else row["days"]})
+    conn.close()
+    return render_template("family_status.html", row=row, pins=status)
+
+
+# ---------------------------------------------------------------------------
+# Sponsor-a-Cohort (public — pay for a whole class, get a join code + report link)
+# ---------------------------------------------------------------------------
+
+
+def _short_name(name):
+    """Privacy for sponsors' reports: 'Chidi Okafor' -> 'Chidi O.'"""
+    parts = (name or "").strip().split()
+    if not parts:
+        return "Student"
+    return parts[0] + (" " + parts[-1][:1] + "." if len(parts) > 1 else "")
+
+
+def _unique_sponsor_owner(cur, email):
+    """One cohort per sponsorship: if this email already owns a centre, number it."""
+    base, candidate, n = email, email, 2
+    while cur.execute("SELECT 1 FROM centres WHERE owner_username = ?", (candidate,)).fetchone():
+        candidate = f"{base} #{n}"
+        n += 1
+    return candidate
+
+
+@app.route("/sponsor")
+def sponsor_page():
+    return render_template("sponsor.html", durations=centre_mod.DURATIONS, pricing=centre_mod.SEAT_PRICING,
+                           min_seats=centre_mod.MIN_SEATS, max_seats=centre_mod.MAX_SEATS,
+                           pricing_json=json.dumps(centre_mod.SEAT_PRICING),
+                           paystack_ready=bool(PAYSTACK_SECRET_KEY))
+
+
+@app.route("/sponsor_start", methods=["POST"])
+@rate_limit(limit=6, window_seconds=600, scope="sponsor_start")
+def sponsor_start():
+    """Guest checkout: create a PENDING centre order for the cohort, then hand to Paystack."""
+    if not PAYSTACK_SECRET_KEY:
+        flash("Online payment is not available right now. Please contact support on WhatsApp.", "danger")
+        return redirect(url_for("sponsor_page"))
+    form = request.form
+    sponsor_name = re.sub(r"\s+", " ", form.get("sponsor_name") or "").strip()[:60]
+    sponsor_email = (form.get("sponsor_email") or "").strip().lower()[:80]
+    sponsor_phone = re.sub(r"\s+", "", form.get("sponsor_phone") or "")[:20]
+    org = re.sub(r"\s+", " ", form.get("organisation") or "").strip()[:80]
+    group_name = re.sub(r"\s+", " ", form.get("group_name") or "").strip()[:60]
+    message = re.sub(r"\s+", " ", form.get("message") or "").strip()[:160]
+    problems = []
+    if len(sponsor_name) < 2:
+        problems.append("Please enter your name.")
+    if not valid_email(sponsor_email):
+        problems.append("Please enter a valid email address.")
+    if len(group_name) < 3:
+        problems.append("Please enter the name of the school or group you are sponsoring.")
+    try:
+        seats = int(form.get("seats") or 0)
+        days = int(form.get("days") or 0)
+    except (TypeError, ValueError):
+        seats = days = 0
+    if not (centre_mod.MIN_SEATS <= seats <= centre_mod.MAX_SEATS):
+        problems.append(f"Students must be between {centre_mod.MIN_SEATS} and {centre_mod.MAX_SEATS}.")
+    if days not in centre_mod.DURATION_LABEL:
+        problems.append("Choose a valid plan length.")
+    if problems:
+        for p_ in problems:
+            flash(p_, "warning")
+        return redirect(url_for("sponsor_page"))
+    amount = centre_mod.order_total(seats, days)
+    label = centre_mod.DURATION_LABEL[days]
+    owner_name = (f"{sponsor_name} ({org})" if org else sponsor_name)[:60]
+    reference = f"PN-SC-{int(time.time())}-{secrets.token_hex(6).upper()}"
+    report_code = secrets.token_hex(10).upper()
+    conn = connect()
+    cur = conn.cursor()
+    owner_key = _unique_sponsor_owner(cur, sponsor_email)
+    cur.execute(
+        "INSERT INTO centre_orders (reference, centre_name, owner_username, owner_name, owner_phone, seats, days, amount, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)",
+        (reference, group_name, owner_key, owner_name, sponsor_phone, seats, days, amount,
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    order_id = cur.lastrowid
+    cur.execute(
+        "INSERT INTO payments (username, plan_id, plan_name, amount, duration_days, transaction_reference, payment_status, currency) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'PENDING', 'NGN')",
+        (owner_key, centre_mod._centre_plan_id(cur), f"Sponsor — {group_name} ({seats} students, {label})"[:120], amount, days, reference))
+    cur.execute(
+        "INSERT INTO sponsorships (reference, centre_order_id, sponsor_org, message, report_code, payment_status) "
+        "VALUES (?, ?, ?, ?, ?, 'PENDING')",
+        (reference, order_id, org or None, message or None, report_code))
+    conn.commit()
+    conn.close()
+    try:
+        resp = requests.post(
+            "https://api.paystack.co/transaction/initialize",
+            json={
+                "email": sponsor_email,
+                "amount": int(round(amount * 100)),
+                "currency": "NGN",
+                "reference": reference,
+                "callback_url": f"{app_url()}/sponsorship_callback",
+                "metadata": {"sponsor_cohort": 1, "seats": seats, "days": days, "group_name": group_name,
+                             "custom_fields": [{"display_name": "Sponsorship", "variable_name": "sponsorship",
+                                                "value": f"{seats} students × {label}"}]},
+            },
+            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        log.exception("Paystack initialise failed (sponsor)")
+        flash("We could not reach Paystack. Please check your connection and try again.", "danger")
+        return redirect(url_for("sponsor_page"))
+    if resp.status_code != 200 or not payload.get("status"):
+        log.error("Paystack init error (sponsor): %s", payload)
+        flash("Payment could not be started. Please try again or contact support.", "danger")
+        return redirect(url_for("sponsor_page"))
+    return redirect(payload["data"]["authorization_url"])
+
+
+def _fulfil_sponsor(reference, payment_data):
+    """Verify a sponsor payment, mark it paid and activate the cohort. Idempotent."""
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        sp = cur.execute("SELECT * FROM sponsorships WHERE reference = ?", (reference,)).fetchone()
+        if not sp:
+            return False, "Sponsorship record not found.", None
+        if sp["payment_status"] == "PAID":
+            return True, "already", sp
+        order = cur.execute("SELECT * FROM centre_orders WHERE reference = ?", (reference,)).fetchone()
+        if not order:
+            return False, "Order not found.", None
+        if payment_data.get("status") != "success":
+            cur.execute("UPDATE sponsorships SET payment_status = 'FAILED' WHERE id = ?", (sp["id"],))
+            cur.execute("UPDATE centre_orders SET status = 'FAILED' WHERE id = ?", (order["id"],))
+            cur.execute("UPDATE payments SET payment_status = 'FAILED' WHERE transaction_reference = ?", (reference,))
+            conn.commit()
+            return False, "Payment was not successful.", None
+        paid_kobo = int(payment_data.get("amount") or 0)
+        expected_kobo = int(round(float(order["amount"]) * 100))
+        if paid_kobo < expected_kobo or (payment_data.get("currency") or "NGN") != "NGN":
+            log.warning("Paystack amount mismatch (sponsor) %s: paid=%s expected=%s", reference, paid_kobo, expected_kobo)
+            cur.execute("UPDATE sponsorships SET payment_status = 'AMOUNT_MISMATCH' WHERE id = ?", (sp["id"],))
+            cur.execute("UPDATE centre_orders SET status = 'AMOUNT_MISMATCH' WHERE id = ?", (order["id"],))
+            cur.execute("UPDATE payments SET payment_status = 'AMOUNT_MISMATCH' WHERE transaction_reference = ?", (reference,))
+            conn.commit()
+            return False, "Payment amount did not match your order. Please contact support.", None
+        cur.execute(
+            """UPDATE payments SET payment_status = 'SUCCESS', paystack_reference = ?, gateway_response = ?, payment_method = ?,
+                                  channel = ?, currency = ?, amount_verified = ?, verified_at = CURRENT_TIMESTAMP, paid_at = CURRENT_TIMESTAMP
+               WHERE transaction_reference = ?""",
+            (payment_data.get("reference"), str(payment_data.get("gateway_response"))[:200], payment_data.get("channel"),
+             payment_data.get("channel"), payment_data.get("currency"), paid_kobo / 100.0, reference))
+        centre, join_code = centre_mod.activate_centre_order(cur, order)
+        cur.execute("UPDATE sponsorships SET payment_status = 'PAID', centre_id = ?, centre_order_id = ?, paid_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (centre["id"], order["id"], sp["id"]))
+        conn.commit()
+        if mail_configured():
+            try:
+                send_email("PrepNova CBT — your cohort is live",
+                           order["owner_username"],
+                           (f"Hello {order['owner_name']},\n\nYour sponsorship of {order['seats']} students at "
+                            f"{order['centre_name']} is active.\n\nJoin code for the students: {join_code}\n"
+                            f"Private impact report: {app_url()}/sponsor_report/{sp['report_code']}\n"
+                            f"Reference: {reference}\n\nShare the join code with the school — students enter it under "
+                            f"Subscribe -> 'I have an Access PIN'."),
+                           email_wrap("Your cohort is live",
+                                      (f"Hello <b>{order['owner_name']}</b>,<br><br>Your sponsorship of "
+                                       f"<b>{order['seats']} students</b> at <b>{order['centre_name']}</b> is active."
+                                       f"<br><br>Join code: <b style='font-size:1.3rem'>{join_code}</b><br>"
+                                       f"Private impact report: <a href='{app_url()}/sponsor_report/{sp['report_code']}'>open it here</a>"),
+                                      "Open PrepNova", f"{app_url()}"))
+            except Exception:
+                log.exception("Sponsor receipt email failed")
+        sp = cur.execute("SELECT * FROM sponsorships WHERE id = ?", (sp["id"],)).fetchone()
+        return True, "ok", sp
+    finally:
+        conn.close()
+
+
+@app.route("/sponsorship_callback")
+def sponsorship_callback():
+    """Paystack returns the sponsor here — show the join code + private report link."""
+    reference = (request.args.get("reference") or request.args.get("trxref") or "").strip()[:64]
+    if not reference or not PAYSTACK_SECRET_KEY:
+        flash("Payment reference missing.", "danger")
+        return redirect(url_for("sponsor_page"))
+    try:
+        resp = requests.get(f"https://api.paystack.co/transaction/verify/{reference}",
+                            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"}, timeout=30)
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        log.exception("Paystack verify failed (sponsor)")
+        flash("We could not verify your payment right now. If you were debited, your cohort will be activated automatically shortly.", "warning")
+        return redirect(url_for("sponsor_page"))
+    if resp.status_code != 200 or not payload.get("status"):
+        flash("Payment verification failed. If you were debited, contact support with your reference.", "danger")
+        return redirect(url_for("sponsor_page"))
+    ok, msg, sp = _fulfil_sponsor(reference, payload.get("data") or {})
+    if not ok:
+        flash(msg, "danger")
+        return redirect(url_for("sponsor_page"))
+    conn = connect()
+    order = conn.execute("SELECT * FROM centre_orders WHERE reference = ?", (reference,)).fetchone()
+    centre = conn.execute("SELECT * FROM centres WHERE id = ?", (sp["centre_id"],)).fetchone()
+    conn.close()
+    join_code = centre["join_code"] if centre else ""
+    share = (f"PrepNova CBT — students of {order['centre_name']}: register free at {app_url()} and enter our code "
+             f"{join_code} under Subscribe -> 'I have an Access PIN' to unlock full mock exams. "
+             f"Sponsored by {order['owner_name']}!")
+    return render_template("sponsor_success.html", order=order, centre=centre, join_code=join_code,
+                           report_url=f"{app_url()}/sponsor_report/{sp['report_code']}",
+                           share=share, days_label=centre_mod.DURATION_LABEL.get(order["days"], ""),
+                           site_url=app_url())
+
+
+@app.route("/sponsor_report/<code>")
+def sponsor_report(code):
+    """Private impact report for the sponsor (unguessable link, no login)."""
+    code = (code or "").strip()[:40]
+    conn = connect()
+    cur = conn.cursor()
+    sp = cur.execute("SELECT * FROM sponsorships WHERE report_code = ? AND payment_status = 'PAID'", (code,)).fetchone()
+    if not sp:
+        conn.close()
+        abort(404)
+    centre = cur.execute("SELECT * FROM centres WHERE id = ?", (sp["centre_id"],)).fetchone()
+    if not centre:
+        conn.close()
+        abort(404)
+    members, subject_rows, weakest = centre_mod._centre_stats(cur, centre)
+    total_mocks = sum(int(m["mocks"] or 0) for m in members)
+    scores = [float(m["avg_pct"]) for m in members if m["avg_pct"] is not None]
+    avg_overall = round(sum(scores) / len(scores), 1) if scores else None
+    improvement = None
+    usernames = [m["username"] for m in members]
+    if usernames:
+        qmarks = ",".join("?" * len(usernames))
+        rows = cur.execute(f"SELECT username, percentage, date_taken FROM results WHERE username IN ({qmarks}) "
+                           f"ORDER BY date_taken ASC, id ASC", usernames).fetchall()
+        per = {}
+        for r in rows:
+            per.setdefault(r["username"], []).append(r["percentage"])
+        pairs = [(v[0], v[-1]) for v in per.values() if len(v) >= 2 and v[0] is not None and v[-1] is not None]
+        if pairs:
+            improvement = round(sum(b for a, b in pairs) / len(pairs) - sum(a for a, b in pairs) / len(pairs), 1)
+    expiry = centre_mod._parse_dt(centre["expires_at"])
+    days_left = (expiry - datetime.now()).days if expiry else None
+    view = [{"name": _short_name(m["name"]), "joined": (m["joined_at"] or "")[:10], "mocks": int(m["mocks"] or 0),
+             "avg": m["avg_pct"], "last": (m["last_active"] or "")[:10]} for m in members]
+    conn.close()
+    now_str = datetime.now().strftime("%d %b %Y")
+    return render_template("sponsor_report.html", sp=sp, centre=centre, members=view, now=now_str,
+                           subject_rows=subject_rows, total_mocks=total_mocks, avg_overall=avg_overall,
+                           improvement=improvement, days_left=days_left,
+                           seats=int(centre["seats"] or 0))
+
+
+# ---------------------------------------------------------------------------
+# Agent Program (logged-in users buy PINs at wholesale, sell at retail, keep margin)
+# ---------------------------------------------------------------------------
+
+AGENT_DISCOUNT = 0.40          # agents buy at 40% off retail
+AGENT_MIN_QTY, AGENT_MAX_QTY = 10, 200
+AGENT_CODE_VALID_DAYS = 180    # unsold agent PINs stay valid 180 days
+
+
+def _agent_short(name):
+    parts = (name or "").strip().split()
+    if not parts:
+        return "Student"
+    return parts[0] + (" " + parts[-1][:1] + "." if len(parts) > 1 else "")
+
+
+@app.route("/agent")
+@login_required
+def agent_page():
+    user = session["user"]
+    conn = connect()
+    cur = conn.cursor()
+    plans = cur.execute("SELECT id, plan_name, price, duration_days FROM subscription_plans WHERE is_active = 1 ORDER BY duration_days").fetchall()
+    stock = cur.execute(
+        """SELECT c.id, c.code, c.days, c.expires_at, c.uses, c.created_at,
+                  r.username AS buyer, r.redeemed_at, COALESCE(u.name, r.username) AS buyer_name
+             FROM access_codes c
+             LEFT JOIN access_code_redemptions r ON r.code_id = c.id
+             LEFT JOIN users u ON u.email = r.username
+            WHERE c.created_by = ?
+            ORDER BY c.id DESC""", (f"AGENT:{user}",)).fetchall()
+    orders = cur.execute("SELECT * FROM agent_orders WHERE agent = ? ORDER BY id DESC", (user,)).fetchall()
+    conn.close()
+    by_days = {p["duration_days"]: p for p in plans}
+    spent = sum(float(o["total"] or 0) for o in orders if o["status"] == "PAID")
+    sold, unsold, earned, potential = 0, 0, 0.0, 0.0
+    view = []
+    for row in stock:
+        plan = by_days.get(row["days"])
+        margin = float(plan["price"]) * AGENT_DISCOUNT if plan else 0.0
+        if row["uses"] > 0:
+            sold += 1
+            earned += margin
+        else:
+            unsold += 1
+            potential += margin
+        view.append({"code": pretty_code(row["code"]), "plan": plan["plan_name"] if plan else "Access",
+                     "expires": (row["expires_at"] or "")[:10], "used": row["uses"] > 0,
+                     "buyer": _agent_short(row["buyer_name"]) if row["uses"] > 0 else None,
+                     "when": (row["redeemed_at"] or "")[:10]})
+    sell_msg = (f"PrepNova CBT — full JAMB, WAEC & Post-UTME mock exams on your phone. "
+                f"I have an access PIN for you! Register free at {app_url()} and I'll send it.")
+    return render_template("agent.html", plans=plans, stock=view, orders=orders,
+                           sold=sold, unsold=unsold, spent=spent, earned=round(earned),
+                           potential=round(potential), discount=AGENT_DISCOUNT,
+                           min_qty=AGENT_MIN_QTY, max_qty=AGENT_MAX_QTY,
+                           paystack_ready=bool(PAYSTACK_SECRET_KEY), sell_msg=sell_msg,
+                           site_url=app_url())
+
+
+@app.route("/agent_order", methods=["POST"])
+@login_required
+@rate_limit(limit=6, window_seconds=600, scope="agent_order")
+def agent_order():
+    """Agent buys a batch of PINs at wholesale — payment upfront, PINs minted after."""
+    user = session["user"]
+    if not PAYSTACK_SECRET_KEY:
+        flash("Online payment is not available right now. Please contact support on WhatsApp.", "danger")
+        return redirect(url_for("agent_page"))
+    try:
+        plan_id = int(request.form.get("plan_id") or 0)
+        qty = int(request.form.get("quantity") or 0)
+    except (TypeError, ValueError):
+        plan_id = qty = 0
+    problems = []
+    if not (AGENT_MIN_QTY <= qty <= AGENT_MAX_QTY):
+        problems.append(f"Quantity must be between {AGENT_MIN_QTY} and {AGENT_MAX_QTY} PINs.")
+    conn = connect()
+    cur = conn.cursor()
+    plan = cur.execute("SELECT id, plan_name, price, duration_days FROM subscription_plans WHERE id = ? AND is_active = 1", (plan_id,)).fetchone()
+    if not plan:
+        problems.append("Choose a valid plan.")
+    if problems:
+        conn.close()
+        for p_ in problems:
+            flash(p_, "warning")
+        return redirect(url_for("agent_page"))
+    unit = round(float(plan["price"]) * (1 - AGENT_DISCOUNT))
+    total = unit * qty
+    reference = f"PN-A-{int(time.time())}-{secrets.token_hex(6).upper()}"
+    cur.execute(
+        "INSERT INTO agent_orders (reference, agent, plan_id, plan_name, quantity, unit_price, total, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')",
+        (reference, user, plan["id"], plan["plan_name"], qty, unit, total))
+    cur.execute(
+        "INSERT INTO payments (username, plan_id, plan_name, amount, duration_days, transaction_reference, payment_status, currency) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'PENDING', 'NGN')",
+        (user, plan["id"], f"Agent stock — {plan['plan_name']} × {qty}"[:120], total, plan["duration_days"], reference))
+    conn.commit()
+    conn.close()
+    try:
+        resp = requests.post(
+            "https://api.paystack.co/transaction/initialize",
+            json={
+                "email": user,
+                "amount": int(round(total * 100)),
+                "currency": "NGN",
+                "reference": reference,
+                "callback_url": f"{app_url()}/agent_callback",
+                "metadata": {"agent_stock": 1, "plan_id": plan["id"], "quantity": qty,
+                             "custom_fields": [{"display_name": "Agent stock", "variable_name": "agent_stock",
+                                                "value": f"{qty} × {plan['plan_name']}"}]},
+            },
+            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        log.exception("Paystack initialise failed (agent)")
+        flash("We could not reach Paystack. Please check your connection and try again.", "danger")
+        return redirect(url_for("agent_page"))
+    if resp.status_code != 200 or not payload.get("status"):
+        log.error("Paystack init error (agent): %s", payload)
+        flash("Payment could not be started. Please try again or contact support.", "danger")
+        return redirect(url_for("agent_page"))
+    return redirect(payload["data"]["authorization_url"])
+
+
+def _fulfil_agent(reference, payment_data):
+    """Verify an agent stock payment, mark it paid and mint the PINs. Idempotent."""
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        order = cur.execute("SELECT * FROM agent_orders WHERE reference = ?", (reference,)).fetchone()
+        if not order:
+            return False, "Order not found.", None
+        if order["status"] == "PAID":
+            return True, "already", order
+        if payment_data.get("status") != "success":
+            cur.execute("UPDATE agent_orders SET status = 'FAILED' WHERE id = ?", (order["id"],))
+            cur.execute("UPDATE payments SET payment_status = 'FAILED' WHERE transaction_reference = ?", (reference,))
+            conn.commit()
+            return False, "Payment was not successful.", None
+        paid_kobo = int(payment_data.get("amount") or 0)
+        expected_kobo = int(round(float(order["total"]) * 100))
+        if paid_kobo < expected_kobo or (payment_data.get("currency") or "NGN") != "NGN":
+            log.warning("Paystack amount mismatch (agent) %s: paid=%s expected=%s", reference, paid_kobo, expected_kobo)
+            cur.execute("UPDATE agent_orders SET status = 'AMOUNT_MISMATCH' WHERE id = ?", (order["id"],))
+            cur.execute("UPDATE payments SET payment_status = 'AMOUNT_MISMATCH' WHERE transaction_reference = ?", (reference,))
+            conn.commit()
+            return False, "Payment amount did not match your order. Please contact support.", None
+        cur.execute(
+            """UPDATE payments SET payment_status = 'SUCCESS', paystack_reference = ?, gateway_response = ?, payment_method = ?,
+                                  channel = ?, currency = ?, amount_verified = ?, verified_at = CURRENT_TIMESTAMP, paid_at = CURRENT_TIMESTAMP
+               WHERE transaction_reference = ?""",
+            (payment_data.get("reference"), str(payment_data.get("gateway_response"))[:200], payment_data.get("channel"),
+             payment_data.get("channel"), payment_data.get("currency"), paid_kobo / 100.0, reference))
+        expires = (datetime.now() + timedelta(days=AGENT_CODE_VALID_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+        generate_access_codes(cur, int(order["quantity"]), int(order["plan_id"]) and _agent_plan_days(cur, order["plan_id"]),
+                              f"Agent stock — {order['plan_name']}", 1, expires, f"AGENT:{order['agent']}")
+        cur.execute("UPDATE agent_orders SET status = 'PAID', paid_at = CURRENT_TIMESTAMP WHERE id = ?", (order["id"],))
+        conn.commit()
+        order = cur.execute("SELECT * FROM agent_orders WHERE id = ?", (order["id"],)).fetchone()
+        return True, "ok", order
+    finally:
+        conn.close()
+
+
+def _agent_plan_days(cur, plan_id):
+    row = cur.execute("SELECT duration_days FROM subscription_plans WHERE id = ?", (plan_id,)).fetchone()
+    return int(row["duration_days"]) if row else 30
+
+
+@app.route("/agent_callback")
+def agent_callback():
+    """Paystack returns the agent here — PINs land in their stock on /agent."""
+    reference = (request.args.get("reference") or request.args.get("trxref") or "").strip()[:64]
+    if not reference or not PAYSTACK_SECRET_KEY:
+        flash("Payment reference missing.", "danger")
+        return redirect(url_for("agent_page"))
+    try:
+        resp = requests.get(f"https://api.paystack.co/transaction/verify/{reference}",
+                            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"}, timeout=30)
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        log.exception("Paystack verify failed (agent)")
+        flash("We could not verify your payment right now. If you were debited, your PINs will appear in your stock shortly.", "warning")
+        return redirect(url_for("agent_page"))
+    if resp.status_code != 200 or not payload.get("status"):
+        flash("Payment verification failed. If you were debited, contact support with your reference.", "danger")
+        return redirect(url_for("agent_page"))
+    ok, msg, order = _fulfil_agent(reference, payload.get("data") or {})
+    if not ok:
+        flash(msg, "danger")
+        return redirect(url_for("agent_page"))
+    flash(f"Payment successful — {order['quantity']} PINs are now in your stock below. Happy selling!", "success")
+    return redirect(url_for("agent_page"))
+
+
+# ---------------------------------------------------------------------------
+# Sales Partners (free to join — earn 30% of a customer's first purchase)
+# ---------------------------------------------------------------------------
+
+PARTNER_COMMISSION = 0.30        # partners earn 30% of a customer's FIRST purchase
+PARTNER_CLEAR_DAYS = 14          # commission clears 14 days after the sale (refund window)
+PARTNER_PAYOUT_MIN = 5000        # minimum payout request (₦)
+PARTNER_COOKIE_DAYS = 30         # how long a referral link is remembered in the visitor's browser
+PARTNER_PROMO_PLANS = ("WhatsApp status & groups", "Campus / school", "Lesson centre or church",
+                       "TikTok / Instagram", "Other")
+
+
+def _partner_by_ref(cur, ref):
+    """Active partner (joined to their user account) for a referral code, or None."""
+    return cur.execute(
+        """SELECT p.*, u.referral_code FROM partners p JOIN users u ON u.email = p.user_email
+           WHERE u.referral_code = ? AND p.status = 'ACTIVE'""",
+        ((ref or "").strip().upper(),)).fetchone()
+
+
+def _maybe_credit_partner(cur, payment):
+    """After a payment is marked SUCCESS: credit the partner 30% if this is the buyer's
+    FIRST purchase, the sale came through the partner's link, and it is not a self-buy.
+    Never raises — a commission problem must never break fulfilment."""
+    try:
+        keys = payment.keys() if hasattr(payment, "keys") else []
+        ref = ((payment["ref_code"] if "ref_code" in keys else "") or "").strip().upper()
+        if not ref:
+            return
+        partner = _partner_by_ref(cur, ref)
+        if not partner:
+            return
+        buyer = (payment["username"] or "").strip().lower()
+        buyer_user = cur.execute("SELECT phone FROM users WHERE lower(email) = ?", (buyer,)).fetchone()
+        buyer_phone = (buyer_user["phone"] if buyer_user else "") or ""
+        if buyer == partner["user_email"].lower() or (buyer_phone and buyer_phone == partner["phone"]):
+            return  # partner buying through their own link — no commission
+        earlier = cur.execute(
+            """SELECT COUNT(*) AS n FROM payments pay
+               LEFT JOIN users us ON lower(us.email) = lower(pay.username)
+               WHERE pay.payment_status = 'SUCCESS' AND pay.id < ?
+                 AND (lower(pay.username) = ? OR (? != '' AND us.phone = ?))""",
+            (payment["id"], buyer, buyer_phone, buyer_phone)).fetchone()["n"]
+        if earlier:
+            return  # loyal customer, not a first purchase — renewals belong to the house
+        already = cur.execute(
+            "SELECT 1 FROM partner_commissions WHERE lower(buyer) = lower(?) LIMIT 1", (buyer,)).fetchone()
+        if already:
+            return  # this customer already earned SOMEONE their first-purchase commission
+                     # (guards against two checkouts completing out of order)
+        amount = float(payment["amount"] or 0)
+        if amount <= 0:
+            return
+        commission = round(amount * PARTNER_COMMISSION, 2)
+        cur.execute(
+            """INSERT INTO partner_commissions (partner_id, payment_id, buyer, product, sale_amount, commission, status, clears_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'CLEARING', datetime('now', ?))""",
+            (partner["id"], payment["id"], buyer, (payment["plan_name"] or "")[:120], amount,
+             commission, f"+{PARTNER_CLEAR_DAYS} days"))
+        log.info("partner commission: partner %s earns %.2f on %s (ref %s)",
+                 partner["id"], commission, payment["transaction_reference"], ref)
+    except Exception:
+        log.exception("partner credit failed for payment %s", payment["id"] if payment else "?")
+
+
+def _partner_financials(cur, partner_id):
+    """Move matured commissions CLEARING -> AVAILABLE and return the partner's money summary."""
+    cur.execute(
+        """UPDATE partner_commissions SET status = 'AVAILABLE'
+           WHERE partner_id = ? AND status = 'CLEARING' AND clears_at <= datetime('now')""",
+        (partner_id,))
+    return cur.execute(
+        """SELECT
+             COALESCE(SUM(CASE WHEN status = 'CLEARING' THEN commission END), 0) AS clearing,
+             COALESCE(SUM(CASE WHEN status = 'AVAILABLE' THEN commission END), 0) AS available,
+             COALESCE(SUM(CASE WHEN status = 'REQUESTED' THEN commission END), 0) AS requested,
+             COALESCE(SUM(CASE WHEN status = 'PAID' THEN commission END), 0) AS paid,
+             COUNT(*) AS sales
+           FROM partner_commissions WHERE partner_id = ?""",
+        (partner_id,)).fetchone()
+
+
+@app.before_request
+def _partner_ref_capture():
+    """Any link carrying ?ref=CODE (marketing page, product page, landing) remembers the
+    partner for 30 days and counts a click for them."""
+    ref = (request.args.get("ref") or "").strip().upper()[:16]
+    if not ref or request.path.startswith("/static/"):
+        return
+    try:
+        conn = connect()
+        row = _partner_by_ref(conn.cursor(), ref)
+        if row:
+            if (session.get("user") or "").lower() != row["user_email"].lower():
+                conn.execute("UPDATE partners SET clicks = clicks + 1 WHERE id = ?", (row["id"],))
+                conn.commit()
+            g.pn_ref = ref
+        conn.close()
+    except Exception:
+        pass
+
+
+# ------------------------------------------------- in-app daily renewal trigger
+# Free PythonAnywhere accounts cannot run scheduled tasks, so the first request
+# of each day runs the renewal job inside the web app. The once-per-day lock
+# lives in app_settings (renewals_auto_state) and is shared with
+# scripts/renewals_daily.py, so a future paid scheduled task can never
+# double-run the job. On failure the lock records the error and allows one
+# retry per hour (a fresh attempt whenever the clock moves to a new hour).
+_RENEW_GUARD = {"slot": None}  # (day, hour) — one attempt per process per hour
+
+
+def run_daily_renewals_once(conn=None, now=None):
+    """Run the daily renewal job at most once a day. Returns the stats dict when
+    the job ran, None when it was skipped (already done today / retried this hour).
+    Never raises: a failure is recorded in the lock for the admin to see."""
+    now = now or datetime.now()
+    today, hour = now.strftime("%Y-%m-%d"), now.hour
+    own = conn is None
+    conn = conn or connect()
+    try:
+        cur = conn.cursor()
+        row = cur.execute("SELECT value FROM app_settings WHERE key = 'renewals_auto_state'").fetchone()
+        state = json.loads(row["value"]) if row and row["value"] else {}
+        if state.get("date") == today and (state.get("status") == "ok" or state.get("hour") == hour):
+            return None
+        stats = run_renewal_day(conn, now=now)
+        cur.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)",
+            ("renewals_auto_state",
+             json.dumps({"date": today, "status": "ok", "hour": hour, "stats": stats}),
+             now.strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        conn.commit()
+        return stats
+    except Exception as exc:
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                ("renewals_auto_state",
+                 json.dumps({"date": today, "status": "error", "hour": hour, "error": str(exc)[:300]}),
+                 now.strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        app.logger.exception("daily renewal job failed")
+        return None
+    finally:
+        if own:
+            conn.close()
+
+
+@app.before_request
+def _renewal_daily_trigger():
+    # Test suites drive run_renewal_day directly; never fire it from test requests.
+    if os.environ.get("TESTING") or app.config.get("TESTING"):
+        return None
+    if request.endpoint == "static":
+        return None
+    now = datetime.now()
+    slot = (now.strftime("%Y-%m-%d"), now.hour)
+    if _RENEW_GUARD["slot"] == slot:
+        return None
+    _RENEW_GUARD["slot"] = slot
+    run_daily_renewals_once(now=now)
+    return None
+
+
+@app.after_request
+def _partner_ref_cookie(response):
+    ref = getattr(g, "pn_ref", None)
+    if ref:
+        response.set_cookie("pn_ref", ref, max_age=PARTNER_COOKIE_DAYS * 86400,
+                            httponly=True, samesite="Lax")
+    return response
+
+
+@app.route("/partners")
+def partners_page():
+    conn = connect()
+    plans = conn.execute(
+        "SELECT plan_name, price FROM subscription_plans WHERE is_active = 1 ORDER BY duration_days").fetchall()
+    products = conn.execute(
+        "SELECT title, price FROM pdf_products WHERE is_active = 1 ORDER BY price DESC LIMIT 8").fetchall()
+    top = conn.execute(
+        """SELECT p.name, COALESCE(SUM(pc.commission), 0) AS earned
+           FROM partners p JOIN partner_commissions pc ON pc.partner_id = p.id
+           WHERE pc.status IN ('AVAILABLE', 'REQUESTED', 'PAID')
+           GROUP BY p.id ORDER BY earned DESC LIMIT 5""").fetchall()
+    conn.close()
+    calc = ([{"name": f"{p['plan_name']} plan", "price": p["price"]} for p in plans]
+            + [{"name": p["title"], "price": p["price"]} for p in products])
+    leaders = []
+    for i, t in enumerate(top, 1):
+        parts = (t["name"] or "").split()
+        shown = parts[0] if parts else "Partner"
+        if len(parts) > 1:
+            shown += " " + parts[-1][0] + "."
+        leaders.append({"rank": i, "name": shown, "earned": t["earned"]})
+    return render_template("partners.html", calc=calc, leaders=leaders,
+                           commission=int(PARTNER_COMMISSION * 100), payout_min=PARTNER_PAYOUT_MIN)
+
+
+@app.route("/partner/terms")
+def partner_terms():
+    return render_template("partner_terms.html")
+
+
+@app.route("/partner/apply", methods=["GET", "POST"])
+@rate_limit(limit=5, window_seconds=600, scope="partner_apply")
+def partner_apply():
+    user = session.get("user")
+    if user:
+        conn = connect()
+        existing = conn.execute("SELECT status FROM partners WHERE user_email = ?", (user,)).fetchone()
+        conn.close()
+        if existing:
+            return redirect(url_for("partner_dashboard"))
+    form = {"name": "", "email": "", "phone": "", "whatsapp": "", "bank_name": "",
+            "account_number": "", "account_name": "", "promo_plan": PARTNER_PROMO_PLANS[0]}
+    if user:
+        conn = connect()
+        row = conn.execute("SELECT name, email, phone FROM users WHERE email = ?", (user,)).fetchone()
+        conn.close()
+        if row:
+            form.update({"name": row["name"] or "", "email": row["email"], "phone": row["phone"] or ""})
+    errors = []
+    if request.method == "POST":
+        form["name"] = " ".join((request.form.get("name") or "").split())[:80]
+        form["email"] = (request.form.get("email") or "").strip().lower()[:254]
+        form["phone"] = normalise_phone(request.form.get("phone") or "") or ""
+        form["bank_name"] = " ".join((request.form.get("bank_name") or "").split())[:80]
+        form["account_number"] = "".join(ch for ch in (request.form.get("account_number") or "") if ch.isdigit())[:12]
+        form["account_name"] = " ".join((request.form.get("account_name") or "").split())[:100]
+        form["promo_plan"] = (request.form.get("promo_plan") or "")[:60]
+        password = request.form.get("password") or ""
+        errors = []
+        if len(form["name"]) < 3:
+            errors.append("Enter your full name.")
+        if not valid_email(form["email"]):
+            errors.append("Enter a valid email address.")
+        if len(form["phone"]) < 11:
+            errors.append("Enter a valid Nigerian phone number (11 digits).")
+        if not form["bank_name"]:
+            errors.append("Enter your bank name.")
+        if len(form["account_number"]) != 10:
+            errors.append("Account number must be exactly 10 digits.")
+        if len(form["account_name"]) < 3:
+            errors.append("Enter the account name exactly as it appears on your bank profile.")
+        if request.form.get("agree") != "on":
+            errors.append("Please accept the Partner terms to continue.")
+        conn = connect()
+        cur = conn.cursor()
+        if not errors:
+            dupe = cur.execute("SELECT 1 FROM partners WHERE user_email = ? OR phone = ?",
+                               (form["email"], form["phone"])).fetchone()
+            if dupe:
+                errors.append("An application with this email or phone number already exists — we will be in touch shortly.")
+        if not errors and not user:
+            exists = cur.execute("SELECT 1 FROM users WHERE email = ?", (form["email"],)).fetchone()
+            if exists:
+                errors.append("You already have a PrepNova account with this email. Log in first, then apply — "
+                              "your application will be linked to your account.")
+        if not errors and not user:
+            if password_problems(password):
+                errors.append("Choose a stronger password (8+ characters, letters and numbers).")
+        if not errors:
+            try:
+                if not user:
+                    now = datetime.now()
+                    cur.execute(
+                        "INSERT INTO users (name, email, phone, password, date_joined, status, is_active, email_verified) "
+                        "VALUES (?, ?, ?, ?, ?, 'ACTIVE', 1, 0)",
+                        (form["name"], form["email"], form["phone"], generate_password_hash(password),
+                         now.strftime("%Y-%m-%d %H:%M:%S")))
+                    cur.execute(
+                        """INSERT INTO subscriptions (username, plan_id, plan_name, start_date, end_date,
+                           payment_reference, payment_status, is_active, amount_paid, currency)
+                           VALUES (?, 0, 'Free Trial', ?, ?, NULL, 'FREE_TRIAL', 1, 0, 'NGN')""",
+                        (form["email"], now.strftime("%Y-%m-%d %H:%M:%S"),
+                         (now + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d %H:%M:%S")))
+                    if mail_configured():
+                        _send_verification(cur, form["email"], form["name"])
+                    else:
+                        cur.execute("UPDATE users SET email_verified = 1 WHERE email = ?", (form["email"],))
+                cur.execute(
+                    """INSERT INTO partners (user_email, name, phone, bank_name, account_number, account_name, promo_plan, status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')""",
+                    (form["email"], form["name"], form["phone"], form["bank_name"],
+                     form["account_number"], form["account_name"], form["promo_plan"]))
+                conn.commit()
+                log.info("partner application: %s (%s)", form["email"], form["promo_plan"])
+                flash("Application received! We'll confirm your partner account on WhatsApp or a quick call, "
+                      "usually within 48 hours. Then your link and dashboard unlock here.", "success")
+                conn.close()
+                return redirect(url_for("partner_dashboard"))
+            except Exception:
+                conn.rollback()
+                conn.close()
+                log.exception("partner application failed")
+                errors.append("Something went wrong saving your application. Please try again.")
+        conn.close()
+    return render_template("partner_apply.html", form=form, promo_plans=PARTNER_PROMO_PLANS,
+                           logged_in=bool(user), errors=errors)
+
+
+@app.route("/partner")
+@login_required
+def partner_dashboard():
+    conn = connect()
+    cur = conn.cursor()
+    partner = cur.execute("SELECT * FROM partners WHERE user_email = ?", (session["user"],)).fetchone()
+    if not partner:
+        conn.close()
+        return render_template("partner_dashboard.html", partner=None)
+    commissions = payouts = None
+    code = link = fin = None
+    if partner["status"] == "ACTIVE":
+        code = ensure_referral_code(cur, partner["user_email"])
+        conn.commit()
+        link = f"{app_url()}/?ref={code}"
+        fin = _partner_financials(cur, partner["id"])
+        conn.commit()
+        commissions = cur.execute(
+            "SELECT * FROM partner_commissions WHERE partner_id = ? ORDER BY id DESC LIMIT 50",
+            (partner["id"],)).fetchall()
+        payouts = cur.execute(
+            "SELECT * FROM partner_payouts WHERE partner_id = ? ORDER BY id DESC LIMIT 20",
+            (partner["id"],)).fetchall()
+    conn.close()
+    return render_template("partner_dashboard.html", partner=partner, code=code, link=link,
+                           fin=fin, commissions=commissions, payouts=payouts,
+                           payout_min=PARTNER_PAYOUT_MIN, clear_days=PARTNER_CLEAR_DAYS,
+                           commission_pct=int(PARTNER_COMMISSION * 100), mask_email=mask_email)
+
+
+@app.route("/partner/payout_request", methods=["POST"])
+@login_required
+@rate_limit(limit=3, window_seconds=600, scope="partner_payout")
+def partner_payout_request():
+    conn = connect()
+    cur = conn.cursor()
+    partner = cur.execute("SELECT * FROM partners WHERE user_email = ? AND status = 'ACTIVE'",
+                          (session["user"],)).fetchone()
+    if not partner:
+        conn.close()
+        flash("Your partner account is not active yet.", "warning")
+        return redirect(url_for("partner_dashboard"))
+    fin = _partner_financials(cur, partner["id"])
+    available = round(float(fin["available"] or 0), 2)
+    if available < PARTNER_PAYOUT_MIN:
+        conn.close()
+        flash(f"You need at least {fmt_naira(PARTNER_PAYOUT_MIN)} available to request a payout. "
+              f"You have {fmt_naira(available)}.", "warning")
+        return redirect(url_for("partner_dashboard"))
+    cur.execute("INSERT INTO partner_payouts (partner_id, amount, status) VALUES (?, ?, 'REQUESTED')",
+                (partner["id"], available))
+    payout_id = cur.lastrowid
+    cur.execute("UPDATE partner_commissions SET status = 'REQUESTED', payout_id = ? "
+                "WHERE partner_id = ? AND status = 'AVAILABLE'", (payout_id, partner["id"]))
+    conn.commit()
+    conn.close()
+    log.info("payout requested: partner %s amount %.2f", partner["id"], available)
+    flash(f"Payout of {fmt_naira(available)} requested — we send payments every week. You'll get an email when it lands.",
+          "success")
+    return redirect(url_for("partner_dashboard"))
+
+
+
+# ---------------------------------------------------------------------------
+# Renewal engine: promo codes, auto-renewal, reminders (round 15)
+# ---------------------------------------------------------------------------
+
+def _validate_promo(cur, code, amount, scope="all"):
+    """Return (promo_row|None, error_message). scope: 'plans' | 'shop' | 'all'."""
+    code = (code or "").strip().upper()[:24]
+    if not code:
+        return None, ""
+    promo = cur.execute("SELECT * FROM promo_codes WHERE code = ?", (code,)).fetchone()
+    if not promo or not promo["active"]:
+        return None, "That promo code doesn't exist."
+    if promo["expires_at"] and str(promo["expires_at"]) < datetime.now().strftime("%Y-%m-%d %H:%M:%S"):
+        return None, "That promo code has expired."
+    if promo["max_uses"] and int(promo["uses"] or 0) >= int(promo["max_uses"]):
+        return None, "That promo code has been fully used."
+    if promo["applies_to"] not in ("all", scope):
+        return None, "That promo code doesn't apply to this purchase."
+    if float(amount or 0) < float(promo["min_amount"] or 0):
+        return None, f"That code needs a minimum purchase of {fmt_naira(promo['min_amount'])}."
+    if amount - _promo_discount(promo, amount) < 100:
+        return None, "That discount is too large for this purchase."
+    return promo, ""
+
+
+def _promo_discount(promo, amount):
+    """Naira amount saved by applying this promo to `amount`."""
+    amount = float(amount or 0)
+    value = float(promo["value"] or 0)
+    if promo["kind"] == "percent":
+        return round(amount * min(value, 100) / 100.0, 2)
+    return round(min(value, amount), 2)
+
+
+def _record_promo_use(cur, payment):
+    """Count one use of the payment's promo code (called on the PENDING->SUCCESS transition)."""
+    try:
+        keys = payment.keys() if hasattr(payment, "keys") else []
+        code = ((payment["promo_code"] if "promo_code" in keys else "") or "").strip().upper()
+        if code:
+            cur.execute("UPDATE promo_codes SET uses = uses + 1 WHERE code = ?", (code,))
+    except Exception:
+        log.exception("promo use tracking failed")
+
+
+@app.route("/promo/check")
+@rate_limit(limit=30, window_seconds=600, scope="promo_check", methods=("GET",))
+def promo_check():
+    """AJAX preview for the coupon field: does this code work on this amount?"""
+    code = (request.args.get("code") or "").strip().upper()[:24]
+    try:
+        amount = float(request.args.get("amount") or 0)
+    except ValueError:
+        amount = 0.0
+    scope = request.args.get("scope") or "all"
+    if not code:
+        return jsonify({"ok": False, "message": ""})
+    conn = connect()
+    promo, msg = _validate_promo(conn.cursor(), code, amount, scope)
+    conn.close()
+    if not promo:
+        return jsonify({"ok": False, "message": msg})
+    discount = _promo_discount(promo, amount)
+    return jsonify({"ok": True, "discount": discount, "total": round(amount - discount, 2),
+                    "message": f"{fmt_naira(discount)} off — you pay {fmt_naira(amount - discount)}"})
+
+
+def _maybe_enable_auto_renew(cur, payment_record, payment_data):
+    """If the buyer ticked 'Renew automatically' and Paystack returned a reusable card
+    authorization, save it and switch auto-renewal on. Never raises."""
+    try:
+        keys = payment_record.keys() if hasattr(payment_record, "keys") else []
+        if "renew_intent" not in keys or not payment_record["renew_intent"]:
+            return
+        auth = payment_data.get("authorization") or {}
+        if not auth.get("reusable") or not auth.get("authorization_code"):
+            return
+        username = payment_record["username"]
+        cur.execute("DELETE FROM saved_cards WHERE authorization_code = ?", (auth.get("authorization_code"),))
+        cur.execute("UPDATE saved_cards SET active = 0 WHERE username = ?", (username,))
+        cur.execute(
+            """INSERT INTO saved_cards (username, authorization_code, card_type, last4, exp_month, exp_year, bank, reusable)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 1)""",
+            (username, auth.get("authorization_code"), str(auth.get("card_type"))[:40],
+             str(auth.get("last4"))[:4], str(auth.get("exp_month"))[:2], str(auth.get("exp_year"))[:4],
+             str(auth.get("bank"))[:60]))
+        cur.execute("UPDATE subscriptions SET auto_renew = 1, auto_renew_retries = 0 WHERE username = ?",
+                    (username,))
+        log.info("auto-renewal enabled for %s (card %s %s)", username, auth.get("bank"), auth.get("last4"))
+    except Exception:
+        log.exception("auto-renew capture failed")
+
+
+@app.route("/auto_renew_toggle", methods=["POST"])
+@login_required
+def auto_renew_toggle():
+    action = (request.form.get("action") or "").strip()
+    conn = connect()
+    cur = conn.cursor()
+    if action == "off":
+        cur.execute("UPDATE subscriptions SET auto_renew = 0 WHERE username = ?", (session["user"],))
+        conn.commit()
+        conn.close()
+        flash("Auto-renewal turned off. Your plan still runs until it expires.", "info")
+        return redirect(url_for("dashboard"))
+    card = cur.execute("SELECT * FROM saved_cards WHERE username = ? AND active = 1 ORDER BY id DESC",
+                       (session["user"],)).fetchone()
+    if not card:
+        conn.close()
+        flash("We don't have a saved card for you yet — pay for your next plan with a card and tick "
+              "'Renew automatically'.", "warning")
+        return redirect(url_for("dashboard"))
+    cur.execute("UPDATE subscriptions SET auto_renew = 1, auto_renew_retries = 0 WHERE username = ?",
+                (session["user"],))
+    conn.commit()
+    conn.close()
+    flash("Auto-renewal back on — your card will be charged the day before expiry.", "success")
+    return redirect(url_for("dashboard"))
+
+
+def _fulfil_renewal(reference, payment_data):
+    """Mark an auto-renewal payment SUCCESS and extend the subscription. Idempotent."""
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        rec = cur.execute("SELECT * FROM payments WHERE transaction_reference = ?", (reference,)).fetchone()
+        if not rec:
+            return False, "not found"
+        if rec["payment_status"] == "SUCCESS":
+            return True, "already"
+        if payment_data.get("status") != "success":
+            cur.execute("UPDATE payments SET payment_status = 'FAILED', gateway_response = ? WHERE transaction_reference = ?",
+                        (str(payment_data.get("gateway_response"))[:200], reference))
+            conn.commit()
+            return False, "renewal charge failed"
+        paid_kobo = int(payment_data.get("amount") or 0)
+        if paid_kobo < int(round(float(rec["amount"]) * 100)):
+            cur.execute("UPDATE payments SET payment_status = 'AMOUNT_MISMATCH' WHERE transaction_reference = ?", (reference,))
+            conn.commit()
+            return False, "amount mismatch"
+        cur.execute(
+            """UPDATE payments SET payment_status = 'SUCCESS', paystack_reference = ?, gateway_response = ?, payment_method = 'saved card',
+                                  channel = 'card', currency = 'NGN', amount_verified = ?, verified_at = CURRENT_TIMESTAMP, paid_at = CURRENT_TIMESTAMP
+               WHERE transaction_reference = ?""",
+            (payment_data.get("reference"), str(payment_data.get("gateway_response"))[:200],
+             paid_kobo / 100.0, reference))
+        start, end = activate_subscription(cur, rec["username"], rec["plan_id"], rec["plan_name"],
+                                           rec["duration_days"], rec["amount"], "NGN", reference)
+        cur.execute("UPDATE subscriptions SET auto_renew = 1, auto_renew_retries = 0, reminder3_for = NULL, winback_for = NULL WHERE username = ?",
+                    (rec["username"],))
+        cur.execute("UPDATE saved_cards SET last_used_at = CURRENT_TIMESTAMP WHERE username = ? AND active = 1",
+                    (rec["username"],))
+        conn.commit()
+        student = cur.execute("SELECT name FROM users WHERE email = ?", (rec["username"],)).fetchone()
+        name = student["name"] if student else "Student"
+        try:
+            send_email("PrepNova CBT — your plan renewed automatically",
+                       rec["username"],
+                       (f"Hello {name},\n\nYour {rec['plan_name']} plan was renewed automatically for {fmt_naira(rec['amount'])}.\n"
+                        f"Reference: {reference}\nNew expiry: {end:%d %B %Y}\n\n"
+                        f"Manage auto-renewal any time from your dashboard.\n\nPrepNova Team"),
+                       email_wrap("Your plan renewed automatically ✅",
+                                  f"Hello <b>{name}</b>,<br><br>Your <b>{rec['plan_name']}</b> plan has been renewed "
+                                  f"for <b>{fmt_naira(rec['amount'])}</b>. New expiry: <b>{end:%d %B %Y}</b>.",
+                                  "Open my dashboard", f"{app_url()}/dashboard"))
+        except Exception:
+            log.exception("renewal receipt email failed")
+        log.info("auto-renewal succeeded for %s (%s)", rec["username"], reference)
+        return True, "ok"
+    finally:
+        conn.close()
+
+
+def _charge_saved_card(authorization_code, email, amount_kobo, reference):
+    """Charge a saved Paystack authorization. Returns (ok, data|message)."""
+    try:
+        resp = requests.post(
+            "https://api.paystack.co/transaction/charge_authorization",
+            json={"email": email, "amount": int(amount_kobo), "authorization_code": authorization_code,
+                  "reference": reference},
+            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"},
+            timeout=30)
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        log.exception("charge_authorization call failed")
+        return False, "network error"
+    if resp.status_code == 200 and payload.get("status") and (payload.get("data") or {}).get("status") == "success":
+        return True, payload["data"]
+    log.warning("renewal charge declined: %s", payload)
+    return False, "declined"
+
+
+def run_renewal_day(conn, now=None, charge_fn=None):
+    """The daily renewal job — safe to run multiple times per day.
+    1) T-3 renewal reminders (auto-renew off)  2) T-1 pre-charge notices (auto-renew on)
+    3) auto-renewal charges the day before expiry  4) win-back emails ~7 days after expiry.
+    Returns a stats dict. charge_fn lets tests mock the Paystack charge."""
+    now = now or datetime.now()
+    cur = conn.cursor()
+    stats = {"reminders": 0, "notices": 0, "renewed": 0, "declined": 0, "winbacks": 0}
+    fmt = "%Y-%m-%d %H:%M:%S"
+    subs = cur.execute("SELECT * FROM subscriptions WHERE is_active = 1 AND end_date IS NOT NULL").fetchall()
+    for s in subs:
+        try:
+            end = datetime.strptime(s["end_date"], fmt)
+        except (ValueError, TypeError):
+            continue
+        days_left = (end - now).total_seconds() / 86400.0
+        username = s["username"]
+        if s["payment_status"] == "FREE_TRIAL":
+            continue
+        # ---- auto-renew charge (day before expiry, keeps continuous access)
+        if s["auto_renew"] and 0 < days_left <= 1:
+            card = cur.execute("SELECT * FROM saved_cards WHERE username = ? AND active = 1 AND reusable = 1 ORDER BY id DESC",
+                               (username,)).fetchone()
+            if not card:
+                continue
+            plan = cur.execute("SELECT * FROM subscription_plans WHERE id = ?", (s["plan_id"],)).fetchone()
+            if not plan:
+                continue
+            reference = f"PN-RN-{int(time.time())}-{secrets.token_hex(6).upper()}"
+            cur.execute(
+                "INSERT INTO payments (username, plan_id, plan_name, amount, duration_days, transaction_reference, payment_status, currency, payment_method) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'PENDING', 'NGN', 'saved card')",
+                (username, plan["id"], plan["plan_name"], plan["price"], plan["duration_days"], reference))
+            conn.commit()
+            charge = charge_fn or _charge_saved_card
+            ok, data = charge(card["authorization_code"], username, int(round(float(plan["price"]) * 100)), reference)
+            if ok:
+                _fulfil_renewal(reference, data)
+                stats["renewed"] += 1
+            else:
+                cur.execute("UPDATE payments SET payment_status = 'FAILED', gateway_response = ? WHERE transaction_reference = ?",
+                            (str(data)[:200], reference))
+                retries = int(s["auto_renew_retries"] or 0) + 1
+                if retries >= 2:
+                    cur.execute("UPDATE subscriptions SET auto_renew = 0, auto_renew_retries = ? WHERE username = ?",
+                                (retries, username))
+                    try:
+                        send_email("PrepNova CBT — we couldn't renew you automatically",
+                                   username,
+                                   ("Hello,\n\nWe tried to charge your saved card to renew your plan but it was declined twice.\n"
+                                    f"Your access ends {end:%d %B %Y}. Renew manually here: {app_url()}/subscribe\n\n"
+                                    "PrepNova Team"),
+                                   email_wrap("Auto-renewal stopped",
+                                              "We couldn't charge your saved card, so auto-renewal is now off. "
+                                              f"Your access ends <b>{end:%d %B %Y}</b> — renew manually to keep practising.",
+                                              "Renew now", f"{app_url()}/subscribe"))
+                    except Exception:
+                        log.exception("renewal-stop email failed")
+                else:
+                    cur.execute("UPDATE subscriptions SET auto_renew_retries = ? WHERE username = ?", (retries, username))
+                conn.commit()
+                stats["declined"] += 1
+            continue
+        # ---- reminders / pre-charge notices
+        if 0 < days_left <= 3 and s["reminder3_for"] != s["end_date"]:
+            if s["auto_renew"]:
+                card = cur.execute("SELECT * FROM saved_cards WHERE username = ? AND active = 1 ORDER BY id DESC",
+                                   (username,)).fetchone()
+                _plan = cur.execute("SELECT price FROM subscription_plans WHERE id = ?", (s["plan_id"],)).fetchone()
+                _price = fmt_naira(_plan["price"]) if _plan else ""
+                if card:
+                    try:
+                        send_email("PrepNova CBT — your plan renews tomorrow",
+                                   username,
+                                   (f"Hello,\n\nYour {s['plan_name']} plan renews tomorrow — {_price} will be charged to your "
+                                    f"{card['bank'] or 'card'} card ••{card['last4']} automatically.\n"
+                                    f"Don't want that? Turn it off in your dashboard: {app_url()}/dashboard\n\nPrepNova Team"),
+                                   email_wrap("Your plan renews tomorrow",
+                                              f"Your <b>{s['plan_name']}</b> plan renews tomorrow — your "
+                                              f"{card['bank'] or 'card'} card ••{card['last4']} will be charged automatically.",
+                                              "Manage auto-renewal", f"{app_url()}/dashboard"))
+                    except Exception:
+                        log.exception("pre-charge notice failed")
+                    stats["notices"] += 1
+            else:
+                try:
+                    send_email("PrepNova CBT — your plan expires soon",
+                               username,
+                               (f"Hello,\n\nYour {s['plan_name']} plan ends {end:%d %B %Y}.\n"
+                                f"Keep your streak and your access — renew in one minute: {app_url()}/subscribe\n\nPrepNova Team"),
+                               email_wrap("Your plan expires soon ⏳",
+                                          f"Your <b>{s['plan_name']}</b> plan ends <b>{end:%d %B %Y}</b>. "
+                                          "Renew now and keep every feature — no days lost.",
+                                          "Renew my plan", f"{app_url()}/subscribe"))
+                except Exception:
+                    log.exception("expiry reminder failed")
+                stats["reminders"] += 1
+            cur.execute("UPDATE subscriptions SET reminder3_for = ? WHERE username = ?", (s["end_date"], username))
+            conn.commit()
+    # ---- win-backs: latest subscription per user, expired 6-10 days ago
+    expired = cur.execute(
+        """SELECT s.* FROM subscriptions s
+           JOIN (SELECT username, MAX(id) AS mid FROM subscriptions GROUP BY username) x ON x.mid = s.id
+           WHERE s.end_date IS NOT NULL AND s.winback_for IS NOT s.end_date
+             AND s.end_date < ? AND s.end_date >= ?""",
+        (now.strftime(fmt), (now - timedelta(days=10)).strftime(fmt))).fetchall()
+    for s in expired:
+        try:
+            end = datetime.strptime(s["end_date"], fmt)
+        except (ValueError, TypeError):
+            continue
+        if not (timedelta(days=6) <= now - end <= timedelta(days=10)):
+            continue
+        code = "COMEBACK-" + "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(4))
+        cur.execute(
+            """INSERT INTO promo_codes (code, kind, value, max_uses, expires_at, applies_to, note)
+               VALUES (?, 'percent', 20, 1, datetime('now', '+30 days'), 'all', ?)""",
+            (code, f"win-back {s['username']}"))
+        cur.execute("UPDATE subscriptions SET winback_for = ? WHERE id = ?", (s["end_date"], s["id"]))
+        conn.commit()
+        try:
+            send_email("PrepNova — we miss you (20% off inside)",
+                       s["username"],
+                       (f"Hello,\n\nYour PrepNova access ended {end:%d %B %Y}. "
+                        f"Here's 20% off your next plan if you come back this month:\n\nCode: {code}\n\n"
+                        f"Use it at checkout: {app_url()}/subscribe\n\nPrepNova Team"),
+                       email_wrap("We miss you — 20% off 🎁",
+                                  "Your access ended, but your progress is waiting. Here's <b>20% off</b> "
+                                  f"your next plan: <code>{code}</code>",
+                                  "Claim my discount", f"{app_url()}/subscribe"))
+        except Exception:
+            log.exception("win-back email failed")
+        stats["winbacks"] += 1
+    return stats
+
+
+
+# ---------------------------------------------------------------------------
+# PDF Study-Pack Shop (public — instant-download packs, guest checkout)
+# ---------------------------------------------------------------------------
+
+PDF_MAX_DOWNLOADS = 5
+PDF_LINK_DAYS = 14
+
+PRODUCT_DETAILS = {
+    "lekki-headmaster-2026": [
+        "Chapter-by-chapter summary of all 12 chapters (Dusk to Dawn)",
+        "21-character guide — names, roles and relationships",
+        "8 major themes explained the way JAMB asks them",
+        "Exam strategy: what JAMB asks and how to answer",
+        "50 practice questions with a fully explained answer key",
+        "Clean printable layout, roughly 14 pages",
+    ],
+    "jamb-english-past-questions": [
+        "Up to 60 past-style Use of English questions",
+        "Comprehension, lexis, structure and novel-style practice",
+        "Full answer key with explanations for every question",
+        "Mark-yourself format with study instructions",
+    ],
+    "waec-english-past-questions": [
+        "Up to 60 WAEC English past-style questions",
+        "Lexis, structure, comprehension and orals-style practice",
+        "Full answer key with explanations",
+        "Mark-yourself format with study instructions",
+    ],
+    "so-the-path-does-not-die": [
+        "The prologue, all 24 chapters and the epilogue in 12 clear summaries",
+        "25-character guide — names, roles and aliases (Kizzy, Cammy, Scraps…)",
+        "8 major themes explained the WASSCE way",
+        "Key terms decoded: digba, fafei, musu ba, yeliba, Denkileni",
+        "Exam strategy + 50 practice questions with a fully explained key",
+        "Clean printable layout, instant download",
+    ],
+    "to-kill-a-mockingbird": [
+        "All 31 chapters in 12 clear section summaries (Parts One and Two)",
+        "26-character guide — the Finches, Boo Radley, the Ewells, the Cunninghams",
+        "8 major themes incl. the mockingbird symbol decoded",
+        "Quote bank and exam strategy for essay and objective questions",
+        "50 practice questions with a fully explained answer key",
+        "Clean printable layout, instant download",
+    ],
+    "an-inspector-calls": [
+        "The entire play, act by act, in 8 clear summaries",
+        "Every character decoded — the Birlings, Gerald, Goole, Eva Smith/Daisy Renton",
+        "8 themes incl. responsibility, class and the generational divide",
+        "Staging decoded — the lighting cue, the photograph, dramatic irony",
+        "50 practice questions with a fully explained answer key",
+        "Clean printable layout, instant download",
+    ],
+    "the-marriage-of-anansewa": [
+        "The whole play, act by act, in 10 clear summaries",
+        "13-character guide — Ananse, Anansewa, the four chiefs, Christie, the Storyteller…",
+        "8 themes incl. greed, the head-drink and the fake funeral",
+        "The folklore frame decoded — Storyteller, Players and the spider's web",
+        "50 practice questions with a fully explained answer key",
+        "Clean printable layout, instant download",
+    ],
+    "redemption-road": [
+        "All 31 chapters + the final letter in 12 clear summaries",
+        "16-character guide — Bendu, Commander Cobra, Tenneh, May, the whole household",
+        "8 themes incl. justice, trauma and the road to redemption",
+        "The title's history decoded — Liberia's 1980 coup and the executions",
+        "50 practice questions with a fully explained answer key",
+        "Clean printable layout, instant download",
+    ],
+    "waec-african-poetry": [
+        "All six set poems analysed: Once Upon a Time, New Tongue, Night, Not My Business, Hearty Garlands, A Breast of the Sea",
+        "The six poets at a glance — country, persona and concern",
+        "8 anthology-wide themes + poem-pairing guide for essays",
+        "Devices decoded — metonymy, apostrophe, panegyric, allusion",
+        "50 practice questions with a fully explained answer key",
+        "Clean printable layout, instant download",
+    ],
+    "waec-literature-bundle": [
+        "So the Path Does Not Die — complete pack (12 summaries, 25 characters, 50 questions)",
+        "To Kill a Mockingbird — complete pack (12 summaries, 26 characters, 50 questions)",
+        "An Inspector Calls — complete pack (act-by-act, staging, 50 questions)",
+        "The Marriage of Anansewa — complete pack (act-by-act, 50 questions)",
+        "Redemption Road — complete pack (12 summaries, 16 characters, 50 questions)",
+        "African Poetry — complete anthology pack (6 poems, 50 questions)",
+        "300 practice questions total with explained answer keys — save ₦2,200",
+    ],
+    "offline-jamb-cbt": [
+        "The full JAMB CBT experience in one file — no app install, no network, no data charges",
+        "Compulsory Use of English + any 3 of 13 JAMB subjects — almost 7,000 questions inside",
+        "Real exam format: 180 questions, 120 minutes, scored over 400 exactly like JAMB",
+        "Fresh questions every attempt — take mock after mock and never repeat yourself",
+        "Instant offline marking: subject scores, JAMB score and a full explained review",
+        "Resume where you stopped, attempt history and an on-screen calculator — all offline",
+        "Works on any phone or laptop — just open the file in Chrome",
+    ],
+    "offline-waec-cbt": [
+        "All 8 official objective papers: English Paper 1 (Lexis & Structure) and Paper 3 (Test of Orals), Mathematics, Biology, Chemistry, Physics, Economics, Government",
+        "Real 2026 WASSCE formats — the exact question count and duration of each paper",
+        "Instant marking with your percentage and a WAEC-style A1–F9 grade",
+        "Every question fully explained in the offline review",
+        "Resume where you stopped, attempt history and an on-screen calculator — all offline",
+        "Works on any phone or laptop — just open the file in Chrome",
+    ],
+}
+
+# (badge text, bootstrap colour) shown on shop + product pages
+PRODUCT_BADGES = {
+    "lekki-headmaster-2026": ("JAMB 2026 · compulsory novel", "primary"),
+    "so-the-path-does-not-die": ("WAEC 2026–2030 · set text", "success"),
+    "to-kill-a-mockingbird": ("WAEC 2026–2030 · set text", "success"),
+    "an-inspector-calls": ("WAEC 2026–2030 · set text", "success"),
+    "the-marriage-of-anansewa": ("WAEC 2026–2030 · set text", "success"),
+    "redemption-road": ("WAEC 2026–2030 · set text", "success"),
+    "waec-african-poetry": ("WAEC 2026–2030 · poetry anthology", "success"),
+    "waec-literature-bundle": ("BEST VALUE · all 6 WAEC packs", "warning"),
+    "offline-jamb-cbt": ("WORKS OFFLINE · no data needed", "info"),
+    "offline-waec-cbt": ("WORKS OFFLINE · WAEC SSCE", "info"),
+    "jamb-english-past-questions": ("question pack", "secondary"),
+    "waec-english-past-questions": ("question pack", "secondary"),
+}
+
+
+def _pdf_plan_id(cur):
+    """Hidden subscription_plans row for PDF orders (payments.plan_id is NOT NULL)."""
+    row = cur.execute("SELECT id FROM subscription_plans WHERE plan_name = 'Digital study packs'").fetchone()
+    if row:
+        return row["id"]
+    cur.execute("INSERT INTO subscription_plans (plan_name, price, duration_days, description, is_active) "
+                "VALUES ('Digital study packs', 0, 30, 'Internal row for PDF shop orders', 0)")
+    return cur.execute("SELECT id FROM subscription_plans WHERE plan_name = 'Digital study packs'").fetchone()["id"]
+
+
+@app.route("/shop")
+def shop():
+    conn = connect()
+    products = conn.execute(
+        """SELECT p.*, (SELECT COUNT(*) FROM pdf_orders o WHERE o.product_id = p.id AND o.payment_status = 'PAID') AS sold
+             FROM pdf_products p WHERE p.is_active = 1 ORDER BY p.price DESC""").fetchall()
+    conn.close()
+    return render_template("shop.html", products=products, badges=PRODUCT_BADGES)
+
+
+@app.route("/shop/<slug>")
+def product_page(slug):
+    conn = connect()
+    product = conn.execute("SELECT * FROM pdf_products WHERE slug = ? AND is_active = 1", (slug,)).fetchone()
+    conn.close()
+    if not product:
+        abort(404)
+    sub_free = False
+    if slug in ("offline-jamb-cbt", "offline-waec-cbt") and session.get("user"):
+        try:
+            sub = get_subscription(session["user"])
+            sub_free = bool(sub["active"]) and not sub["is_trial"]
+        except Exception:
+            sub_free = False
+    return render_template("product.html", p=product, details=PRODUCT_DETAILS.get(slug, []),
+                           badges=PRODUCT_BADGES, paystack_ready=bool(PAYSTACK_SECRET_KEY),
+                           sub_free=sub_free)
+
+
+@app.route("/shop_buy", methods=["POST"])
+@rate_limit(limit=10, window_seconds=600, scope="shop_buy")
+def shop_buy():
+    """Guest checkout for a PDF pack — like gifts, no account needed."""
+    if not PAYSTACK_SECRET_KEY:
+        flash("Online payment is not available right now. Please contact support on WhatsApp.", "danger")
+        return redirect(url_for("shop"))
+    buyer_name = re.sub(r"\s+", " ", request.form.get("buyer_name") or "").strip()[:60]
+    buyer_email = (request.form.get("buyer_email") or "").strip().lower()[:80]
+    if len(buyer_name) < 2:
+        flash("Please enter your name.", "danger")
+        return redirect(request.referrer or url_for("shop"))
+    if not valid_email(buyer_email):
+        flash("Please enter a valid email address — your download link is sent there.", "danger")
+        return redirect(request.referrer or url_for("shop"))
+    conn = connect()
+    cur = conn.cursor()
+    product = cur.execute("SELECT * FROM pdf_products WHERE slug = ? AND is_active = 1",
+                          ((request.form.get("slug") or "").strip()[:60],)).fetchone()
+    if not product:
+        conn.close()
+        flash("That pack is not available.", "danger")
+        return redirect(url_for("shop"))
+    reference = f"PN-P-{int(time.time())}-{secrets.token_hex(6).upper()}"
+    amount = float(product["price"])
+    promo_code = (request.form.get("promo_code") or "").strip().upper()[:24]
+    if promo_code:
+        promo, pmsg = _validate_promo(cur, promo_code, product["price"], "shop")
+        if not promo:
+            conn.close()
+            flash(pmsg, "danger")
+            return redirect(request.referrer or url_for("shop"))
+        amount = max(100.0, round(product["price"] - _promo_discount(promo, product["price"]), 2))
+    cur.execute(
+        "INSERT INTO pdf_orders (reference, product_id, buyer_name, buyer_email, amount, payment_status) "
+        "VALUES (?, ?, ?, ?, ?, 'PENDING')",
+        (reference, product["id"], buyer_name, buyer_email, amount))
+    cur.execute(
+        "INSERT INTO payments (username, plan_id, plan_name, amount, duration_days, transaction_reference, payment_status, currency, ref_code, promo_code) "
+        "VALUES (?, ?, ?, ?, 30, ?, 'PENDING', 'NGN', ?, ?)",
+        (buyer_email, _pdf_plan_id(cur), f"PDF — {product['title']}"[:120], amount, reference,
+         (request.cookies.get("pn_ref") or "").strip().upper()[:16], promo_code or None))
+    conn.commit()
+    conn.close()
+    try:
+        resp = requests.post(
+            "https://api.paystack.co/transaction/initialize",
+            json={
+                "email": buyer_email,
+                "amount": int(round(amount * 100)),
+                "currency": "NGN",
+                "reference": reference,
+                "callback_url": f"{app_url()}/pdf_callback",
+                "metadata": {"pdf": 1, "slug": product["slug"],
+                             "custom_fields": [{"display_name": "Pack", "variable_name": "pack",
+                                                "value": product["title"][:100]}]},
+            },
+            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        log.exception("Paystack initialise failed (pdf shop)")
+        flash("We could not reach Paystack. Please check your connection and try again.", "danger")
+        return redirect(url_for("product_page", slug=product["slug"]))
+    if resp.status_code != 200 or not payload.get("status"):
+        log.error("Paystack init error (pdf shop): %s", payload)
+        flash("Payment could not be started. Please try again or contact support.", "danger")
+        return redirect(url_for("product_page", slug=product["slug"]))
+    return redirect(payload["data"]["authorization_url"])
+
+
+def _fulfil_pdf(reference, payment_data):
+    """Verify a PDF order, mark it paid and mint the download code. Idempotent."""
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        order = cur.execute("SELECT * FROM pdf_orders WHERE reference = ?", (reference,)).fetchone()
+        if not order:
+            return False, "Order not found.", None
+        if order["payment_status"] == "PAID":
+            return True, "already", order
+        if payment_data.get("status") != "success":
+            cur.execute("UPDATE pdf_orders SET payment_status = 'FAILED' WHERE id = ?", (order["id"],))
+            cur.execute("UPDATE payments SET payment_status = 'FAILED' WHERE transaction_reference = ?", (reference,))
+            conn.commit()
+            return False, "Payment was not successful.", None
+        paid_kobo = int(payment_data.get("amount") or 0)
+        expected_kobo = int(round(float(order["amount"]) * 100))
+        if paid_kobo < expected_kobo or (payment_data.get("currency") or "NGN") != "NGN":
+            log.warning("Paystack amount mismatch (pdf) %s: paid=%s expected=%s", reference, paid_kobo, expected_kobo)
+            cur.execute("UPDATE pdf_orders SET payment_status = 'AMOUNT_MISMATCH' WHERE id = ?", (order["id"],))
+            cur.execute("UPDATE payments SET payment_status = 'AMOUNT_MISMATCH' WHERE transaction_reference = ?", (reference,))
+            conn.commit()
+            return False, "Payment amount did not match your order. Please contact support.", None
+        code = secrets.token_hex(10).upper()
+        product = cur.execute("SELECT * FROM pdf_products WHERE id = ?", (order["product_id"],)).fetchone()
+        bundle_items = []  # [(title, download_code)]
+        if product and product["bundle_items"]:
+            for slug in [x.strip() for x in product["bundle_items"].split(",") if x.strip()]:
+                item = cur.execute("SELECT * FROM pdf_products WHERE slug = ? AND is_active = 1", (slug,)).fetchone()
+                if item:
+                    icode = secrets.token_hex(10).upper()
+                    cur.execute(
+                        "INSERT INTO pdf_orders (reference, product_id, buyer_name, buyer_email, amount, payment_status, download_code, paid_at) "
+                        "VALUES (?, ?, ?, ?, 0, 'PAID', ?, CURRENT_TIMESTAMP)",
+                        (f"{reference}-{item['id']}", item["id"], order["buyer_name"], order["buyer_email"], icode))
+                    bundle_items.append((item["title"], icode))
+            if bundle_items:
+                code = None  # bundle parent: children carry the real codes
+        cur.execute(
+            """UPDATE payments SET payment_status = 'SUCCESS', paystack_reference = ?, gateway_response = ?, payment_method = ?,
+                                  channel = ?, currency = ?, amount_verified = ?, verified_at = CURRENT_TIMESTAMP, paid_at = CURRENT_TIMESTAMP
+               WHERE transaction_reference = ?""",
+            (payment_data.get("reference"), str(payment_data.get("gateway_response"))[:200], payment_data.get("channel"),
+             payment_data.get("channel"), payment_data.get("currency"), paid_kobo / 100.0, reference))
+        cur.execute("UPDATE pdf_orders SET payment_status = 'PAID', download_code = ?, paid_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (code, order["id"]))
+        _pdf_pay = cur.execute("SELECT * FROM payments WHERE transaction_reference = ?", (reference,)).fetchone()
+        _maybe_credit_partner(cur, _pdf_pay)
+        _record_promo_use(cur, _pdf_pay)
+        conn.commit()
+        order = cur.execute("SELECT * FROM pdf_orders WHERE id = ?", (order["id"],)).fetchone()
+        if mail_configured():
+            if bundle_items:
+                link_lines = "\n".join(f"  {t}: {app_url()}/pdf_download/{c}" for t, c in bundle_items)
+                html_links = "<br>".join(f"<a href='{app_url()}/pdf_download/{c}'>{t}</a>" for t, c in bundle_items)
+                try:
+                    send_email("PrepNova CBT — your study bundle is ready",
+                               order["buyer_email"],
+                               (f"Hello {order['buyer_name']},\n\nThank you for buying {product['title']}. "
+                                f"Your download links (each valid {PDF_LINK_DAYS} days, up to {PDF_MAX_DOWNLOADS} downloads):\n\n"
+                                f"{link_lines}\n\nReference: {reference}"),
+                               email_wrap("Your study bundle is ready",
+                                          f"Hello <b>{order['buyer_name']}</b>,<br><br>Thank you for buying "
+                                          f"<b>{product['title']}</b>.<br><br>{html_links}",
+                                          "Open PrepNova", f"{app_url()}/shop"))
+                except Exception:
+                    log.exception("PDF bundle receipt email failed")
+            else:
+                try:
+                    send_email("PrepNova CBT — your study pack is ready",
+                               order["buyer_email"],
+                               (f"Hello {order['buyer_name']},\n\nThank you for buying {product['title']}.\n\n"
+                                f"Download link (valid {PDF_LINK_DAYS} days, up to {PDF_MAX_DOWNLOADS} downloads):\n"
+                                f"{app_url()}/pdf_download/{order['download_code']}\n\nReference: {reference}"),
+                               email_wrap("Your study pack is ready",
+                                          (f"Hello <b>{order['buyer_name']}</b>,<br><br>Thank you for buying "
+                                           f"<b>{product['title']}</b>.<br><br>"
+                                           f"<a href='{app_url()}/pdf_download/{order['download_code']}'>Download it here</a> "
+                                           f"(valid {PDF_LINK_DAYS} days, up to {PDF_MAX_DOWNLOADS} downloads)."),
+                                          "Open PrepNova", f"{app_url()}/shop"))
+                except Exception:
+                    log.exception("PDF receipt email failed")
+        return True, "ok", order
+    finally:
+        conn.close()
+
+
+@app.route("/pdf_callback")
+def pdf_callback():
+    """Paystack returns the buyer here — download button page."""
+    reference = (request.args.get("reference") or request.args.get("trxref") or "").strip()[:64]
+    if not reference or not PAYSTACK_SECRET_KEY:
+        flash("Payment reference missing.", "danger")
+        return redirect(url_for("shop"))
+    try:
+        resp = requests.get(f"https://api.paystack.co/transaction/verify/{reference}",
+                            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"}, timeout=30)
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        log.exception("Paystack verify failed (pdf)")
+        flash("We could not verify your payment right now. If you were debited, your download link will be emailed to you shortly.", "warning")
+        return redirect(url_for("shop"))
+    if resp.status_code != 200 or not payload.get("status"):
+        flash("Payment verification failed. If you were debited, contact support with your reference.", "danger")
+        return redirect(url_for("shop"))
+    ok, msg, order = _fulfil_pdf(reference, payload.get("data") or {})
+    if not ok:
+        flash(msg, "danger")
+        return redirect(url_for("shop"))
+    conn = connect()
+    product = conn.execute("SELECT * FROM pdf_products WHERE id = ?", (order["product_id"],)).fetchone()
+    extra_downloads = conn.execute(
+        """SELECT o.download_code, p.title FROM pdf_orders o JOIN pdf_products p ON p.id = o.product_id
+           WHERE o.reference LIKE ? AND o.payment_status = 'PAID' ORDER BY o.id""",
+        (reference + "-%",)).fetchall()
+    conn.close()
+    return render_template("pdf_success.html", order=order, p=product,
+                           download_url=f"{app_url()}/pdf_download/{order['download_code']}",
+                           extra_downloads=extra_downloads,
+                           max_downloads=PDF_MAX_DOWNLOADS, link_days=PDF_LINK_DAYS)
+
+
+@app.route("/pdf_download/<code>")
+def pdf_download(code):
+    """Serve the paid PDF (unguessable code, capped downloads, time-limited)."""
+    code = (code or "").strip().upper()[:40]
+    conn = connect()
+    order = conn.execute("SELECT * FROM pdf_orders WHERE download_code = ? AND payment_status = 'PAID'", (code,)).fetchone()
+    if not order:
+        conn.close()
+        abort(404)
+    product = conn.execute("SELECT * FROM pdf_products WHERE id = ?", (order["product_id"],)).fetchone()
+    expired = False
+    if order["paid_at"]:
+        try:
+            from datetime import datetime as _dt
+            paid = _dt.strptime(order["paid_at"][:19], "%Y-%m-%d %H:%M:%S")
+            expired = (datetime.utcnow() - paid).days > PDF_LINK_DAYS
+        except ValueError:
+            expired = False
+    if expired or int(order["downloads"] or 0) >= PDF_MAX_DOWNLOADS:
+        conn.close()
+        abort(404)
+    cur = conn.cursor()
+    cur.execute("UPDATE pdf_orders SET downloads = downloads + 1 WHERE id = ?", (order["id"],))
+    conn.commit()
+    from flask import send_file  # local import matches the result-slip generator pattern
+    slug = product["slug"]
+    site = app_url()
+    if slug == "lekki-headmaster-2026":
+        buf = pdf_store.build_lekki_pdf(site)
+    elif slug == "so-the-path-does-not-die":
+        buf = pdf_store.build_so_path_pdf(site)
+    elif slug == "to-kill-a-mockingbird":
+        buf = pdf_store.build_mockingbird_pdf(site)
+    elif slug == "an-inspector-calls":
+        buf = pdf_store.build_inspector_pdf(site)
+    elif slug == "the-marriage-of-anansewa":
+        buf = pdf_store.build_anansewa_pdf(site)
+    elif slug == "redemption-road":
+        buf = pdf_store.build_redemption_pdf(site)
+    elif slug == "waec-african-poetry":
+        buf = pdf_store.build_poetry_pdf(site)
+    elif slug == "waec-literature-bundle":
+        buf = pdf_store.build_waec_bundle_pdf(site)
+    elif slug == "jamb-english-past-questions":
+        buf = pdf_store.build_past_questions_pdf(conn, "JAMB", "%English%",
+                                                 "JAMB Use of English — Past-Style Question Pack",
+                                                 "Practice questions compiled from the PrepNova question bank", 60, site)
+    elif slug == "waec-english-past-questions":
+        buf = pdf_store.build_past_questions_pdf(conn, "WAEC", "%English%",
+                                                 "WAEC English — Past-Style Question Pack",
+                                                 "Practice questions compiled from the PrepNova question bank", 60, site)
+    elif slug == "offline-jamb-cbt":
+        buf = offline_cbt.build_offline_jamb_html(conn, site, order["buyer_name"], order["reference"])
+    elif slug == "offline-waec-cbt":
+        buf = offline_cbt.build_offline_waec_html(conn, site, order["buyer_name"], order["reference"])
+    else:
+        conn.close()
+        abort(404)
+    conn.close()
+    if slug == "offline-jamb-cbt":
+        # Self-contained HTML app: download once, then it runs with zero network.
+        return send_file(buf, as_attachment=True, download_name="PrepNova_Offline_JAMB_CBT.html",
+                         mimetype="text/html")
+    if slug == "offline-waec-cbt":
+        return send_file(buf, as_attachment=True, download_name="PrepNova_Offline_WAEC_Simulator.html",
+                         mimetype="text/html")
+    return send_file(buf, as_attachment=True, download_name=f"PrepNova_{slug}.pdf", mimetype="application/pdf")
+
+
+@app.route("/offline_free", methods=["POST"])
+@login_required
+@rate_limit(limit=3, window_seconds=3600, scope="offline_free")
+def offline_free():
+    """The offline simulators (JAMB and WAEC) are free for active (paid) subscribers."""
+    slug = (request.form.get("slug") or "offline-jamb-cbt").strip()[:40]
+    if slug not in ("offline-jamb-cbt", "offline-waec-cbt"):
+        abort(404)
+    sub = get_subscription(session["user"])
+    if not sub["active"] or sub["is_trial"]:
+        flash("The Offline Simulator is free with a paid PrepNova plan — choose a plan to claim it.", "warning")
+        return redirect(url_for("subscribe"))
+    conn = connect()
+    cur = conn.cursor()
+    product = cur.execute("SELECT * FROM pdf_products WHERE slug = ? AND is_active = 1", (slug,)).fetchone()
+    if not product:
+        conn.close()
+        abort(404)
+    reference = f"PN-P-{int(time.time())}-{secrets.token_hex(6).upper()}"
+    code = secrets.token_hex(10).upper()
+    cur.execute(
+        "INSERT INTO pdf_orders (reference, product_id, buyer_name, buyer_email, amount, payment_status, "
+        "download_code, paid_at) VALUES (?, ?, ?, ?, 0, 'PAID', ?, CURRENT_TIMESTAMP)",
+        (reference, product["id"], session.get("name") or session["user"], session["user"], code))
+    cur.execute(
+        "INSERT INTO payments (username, plan_id, plan_name, amount, duration_days, transaction_reference, "
+        "payment_status, currency) VALUES (?, ?, ?, 0, 30, ?, 'SUCCESS', 'NGN')",
+        (session["user"], _pdf_plan_id(cur), f"Offline free — {product['title']}"[:120], reference))
+    conn.commit()
+    conn.close()
+    log.info("Offline simulator (%s) claimed free by subscriber %s (%s)", slug, session["user"], reference)
+    return redirect(url_for("pdf_download", code=code))
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=not IS_PRODUCTION)

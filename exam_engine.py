@@ -1,0 +1,723 @@
+"""
+PrepNova CBT — exam engine.
+
+Design principles (anti-cheating / integrity):
+* The server is the single source of truth: question order, answers, timer and
+  score all live in the database, never in the browser or in the cookie.
+* Correct answers are NEVER sent to the browser during a live attempt.
+* The timer is enforced server-side using `expires_at`; a tampered client
+  countdown cannot extend the exam.
+* Answers are saved question-by-question via CSRF-protected JSON calls, so a
+  refresh, network drop or device change loses nothing.
+* Each student can only have one attempt in progress at a time.
+"""
+
+import json
+import logging
+import random
+from datetime import datetime, timedelta
+
+from db import connect
+from helpers import (
+    JAMB_COURSES, JAMB_DURATION_MIN, JAMB_ENGLISH_QUESTIONS, JAMB_OTHER_QUESTIONS, MIN_BANK_FOR_V2,
+    fetch_question_ids, fetch_questions,
+    new_verification_code, resolve_source, reward_referral_if_due, clear_mistake, record_mistake,
+)
+
+FMT = "%Y-%m-%d %H:%M:%S"
+
+
+# Questions whose topic starts with this prefix are the "reading text" (JAMB recommended novel)
+# section; every full English paper carries READING_TEXT_QUESTIONS of them, like the real UTME.
+READING_TEXT_PREFIX = "Reading Text:"
+READING_TEXT_QUESTIONS = 10
+
+# Fixed section sizes for the rest of a full Use of English paper (after the two passages and the
+# reading text), exactly as the UTME sets it: sentence interpretation 5, antonyms 5, synonyms 5,
+# sentence completion / grammar 10, oral forms 10. Applied to any subject whose curated pool has
+# all these topics (i.e. English); other subjects keep the mixed draw.
+SECTION_QUOTAS = {
+    "Lexis and Structure": 5,
+    "Antonyms": 5,
+    "Synonyms": 5,
+    "Sentence Completion": 10,
+    "Oral English": 10,
+}
+
+
+class ExamError(Exception):
+    """User-facing problem while building or using an attempt."""
+
+
+# ---------------------------------------------------------------------------
+# Building attempts
+# ---------------------------------------------------------------------------
+
+def _seen_questions(cur, username, source):
+    """Question ids this student has already met in earlier attempts (used to avoid repeats)."""
+    if not username:
+        return set()
+    rows = cur.execute(
+        """SELECT DISTINCT q.question_id FROM exam_attempt_questions q
+           JOIN exam_attempts a ON a.id = q.attempt_id
+           WHERE a.username = ? AND q.question_source = ? AND a.status != 'IN_PROGRESS'""",
+        (username, source),
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def _post_utme_source(cur, subject, university):
+    """Where a Post-UTME subject's questions come from.
+
+    A university-specific upload (post_utme_questions) wins when it is big enough; otherwise the
+    UTME subject is drawn from the JAMB bank and 'Current Affairs' from the POST-UTME bank.
+    """
+    from post_utme import bank_for, CA_SUBJECT
+    if university:
+        ids = fetch_question_ids(cur, "post_utme_questions", "POST-UTME", subject, university)
+        if len(ids) >= MIN_BANK_FOR_V2:
+            return "post_utme_questions", ids
+    source, _ = resolve_source(cur, bank_for(subject), subject)
+    if not source and subject == CA_SUBJECT:
+        return None, []
+    return source, (fetch_question_ids(cur, source, bank_for(subject), subject) if source else [])
+
+
+def _plan_subjects(cur, exam_type, subjects, university=None, per_subject=None, english_count=None, username=None,
+                   counts=None):
+    """Return a list of (subject, source, [question_ids]) with randomised, capped ids.
+
+    counts: optional {subject: n} overriding per_subject (Post-UTME papers with uneven sections).
+    """
+    plan = []
+    seen_cache = {}
+    for subject in subjects:
+        if exam_type == "POST-UTME":
+            source, ids = _post_utme_source(cur, subject, university)
+        else:
+            source, _ = resolve_source(cur, exam_type, subject)
+            ids = fetch_question_ids(cur, source, exam_type, subject) if source else []
+        if not ids:
+            raise ExamError(f"No questions are available yet for {subject}. Please try another subject or check back soon.")
+        cap = per_subject
+        if counts and subject in counts:
+            cap = counts[subject]
+        if english_count and subject in ("Use of English", "English"):
+            cap = english_count
+        if source not in seen_cache:
+            seen_cache[source] = _seen_questions(cur, username, source)
+        plan.append((subject, source, _arrange(cur, source, ids, cap, seen_cache[source], exam_type=exam_type,
+                                               subject=subject)))
+    return plan
+
+
+def _arrange(cur, source, ids, cap, seen=None, exam_type=None, subject=None):
+    """Choose and order one subject's questions the way the real CBT does.
+
+    * Passage-linked questions stay together, at the start of the subject (max two passages).
+    * At least half of the questions come from the curated tier-1 bank (applied, exam-standard
+      items) whenever enough exist; the rest are drawn from the general bank.
+    * Questions (and passages) the student has met in earlier attempts are used only when the
+      unseen ones run out, so repeats are as rare as the bank size allows.
+    * Everything else is randomised.
+    """
+    seen = seen or set()
+
+    def fresh_first(items):
+        random.shuffle(items)
+        return [q for q in items if q not in seen] + [q for q in items if q in seen]
+
+    if source != "questions_v2":
+        ids = fresh_first(list(ids))
+        return ids[:cap] if cap else ids
+    meta = {}
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        for r in cur.execute(
+            f"""SELECT q.id, q.passage_id, COALESCE(q.tier, 0), q.topic_id, COALESCE(t.topic_name, '')
+                FROM questions_v2 q LEFT JOIN topics t ON t.id = q.topic_id
+                WHERE q.id IN ({','.join('?' * len(chunk))})""", chunk
+        ):
+            meta[r[0]] = (r[1], r[2], r[3], r[4])
+    # WAEC English Paper 1 is a fixed 40 lexis + 40 structure split — build it exactly that way.
+    if exam_type == "WAEC" and subject == "English" and cap and cap >= 40:
+        lexis, struct = [], []
+        for q in ids:
+            name = meta.get(q, (None, 0, None, ""))[3]
+            if name.startswith("Lexis"):
+                lexis.append(q)
+            elif name.startswith("Structure"):
+                struct.append(q)
+        if lexis and struct:
+            half = cap // 2
+            body = fresh_first(lexis)[:half] + fresh_first(struct)[:cap - half]
+            random.shuffle(body)
+            return body
+    groups, group_topic, curated, general, novel, by_topic = {}, {}, [], [], [], {}
+    for q in ids:
+        p, tier, topic, topic_name = meta.get(q, (None, 0, None, ""))
+        if p:
+            groups.setdefault(p, []).append(q)
+            group_topic.setdefault(p, topic)
+        elif topic_name.startswith(READING_TEXT_PREFIX):
+            novel.append(q)
+        elif tier:
+            curated.append(q)
+            by_topic.setdefault(topic_name, []).append(q)
+        else:
+            general.append(q)
+    keys = list(groups)
+    random.shuffle(keys)
+    # Unseen passages first, then prefer passages of different kinds (e.g. one comprehension + one
+    # cloze), as the real paper does.
+    keys.sort(key=lambda k: any(q in seen for q in groups[k]))
+    picked, seen_topics = [], set()
+    for k in keys:
+        if group_topic[k] not in seen_topics:
+            picked.append(k)
+            seen_topics.add(group_topic[k])
+    picked += [k for k in keys if k not in picked]
+    group_list = [sorted(groups[k]) for k in picked]
+    curated = fresh_first(curated)
+    general = fresh_first(general)
+    limit = cap or (len(ids))
+    max_groups = 2 if limit >= 40 else 1
+    if exam_type == "POST-UTME" and limit < 20:
+        max_groups = 1 if limit >= 10 else 0
+    chosen = [q for g in group_list[:max_groups] for q in g][:limit]
+    # Reading-text (recommended novel) block: a fixed number of questions right after the passages,
+    # as in the real UTME paper. Only used when the block is a small share of the subject.
+    if novel and limit >= 4 * READING_TEXT_QUESTIONS and exam_type != "POST-UTME":
+        block = fresh_first(novel)[:READING_TEXT_QUESTIONS]
+        random.shuffle(block)
+        chosen = (chosen + block)[:limit]
+    room = limit - len(chosen)
+    if room > 0 and exam_type != "POST-UTME" and all(t in by_topic for t in SECTION_QUOTAS):
+        # Fixed sections (English): so many of each kind, unseen first, then anything left over.
+        body, used = [], set()
+        for topic_name, quota in SECTION_QUOTAS.items():
+            pick = fresh_first(by_topic[topic_name])[:min(quota, room - len(body))]
+            body += pick
+            used.update(pick)
+        if len(body) < room:
+            body += fresh_first([q for q in curated if q not in used])[:room - len(body)]
+        random.shuffle(body)
+        return chosen + body
+    want_curated = max(0, (limit + 1) // 2 - len(chosen))
+    take = curated[:want_curated]
+    rest = fresh_first(curated[want_curated:] + general)
+    body = take + rest[:max(0, room - len(take))]
+    random.shuffle(body)
+    return chosen + body
+
+
+def get_open_attempt(username, cur=None):
+    own = cur is None
+    if own:
+        conn = connect()
+        cur = conn.cursor()
+    row = cur.execute(
+        "SELECT * FROM exam_attempts WHERE username = ? AND status = 'IN_PROGRESS' ORDER BY id DESC LIMIT 1",
+        (username,),
+    ).fetchone()
+    if row:
+        # Auto-submit attempts whose time has elapsed
+        if datetime.strptime(row["expires_at"], FMT) <= datetime.now():
+            finalize_attempt(row["id"], cur=cur, auto=True)
+            if own:
+                conn.close()
+            return None
+    if own:
+        conn.close()
+    return row
+
+
+def abandon_open_attempts(username, cur):
+    cur.execute(
+        "UPDATE exam_attempts SET status = 'ABANDONED', submitted_at = ? WHERE username = ? AND status = 'IN_PROGRESS'",
+        (datetime.now().strftime(FMT), username),
+    )
+
+
+def create_attempt(username, exam_type, exam_name, subjects, *, university=None, duration_min=None,
+                   per_subject=None, english_count=None, mode="full", ip=None, ua=None, plan=None, live_id=None,
+                   counts=None):
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        if plan is None:
+            plan = _plan_subjects(cur, exam_type, subjects, university, per_subject, english_count, username=username,
+                                  counts=counts)
+        abandon_open_attempts(username, cur)
+
+        total = sum(len(ids) for _, _, ids in plan)
+        duration = int((duration_min or 60) * 60)
+        started = datetime.now()
+        expires = started + timedelta(seconds=duration)
+
+        cur.execute(
+            """
+            INSERT INTO exam_attempts
+              (username, exam_type, exam_name, university, subjects_json, mode, status, started_at,
+               duration_seconds, expires_at, total_questions, ip_address, user_agent, live_id)
+            VALUES (?, ?, ?, ?, ?, ?, 'IN_PROGRESS', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (username, exam_type, exam_name, university, json.dumps(subjects), mode,
+             started.strftime(FMT), duration, expires.strftime(FMT), total, ip, (ua or "")[:255], live_id),
+        )
+        attempt_id = cur.lastrowid
+
+        rows = []
+        position = 0
+        for subject, source, ids in plan:
+            for sub_pos, qid in enumerate(ids, start=1):
+                position += 1
+                rows.append((attempt_id, position, subject, sub_pos, source, qid))
+        cur.executemany(
+            "INSERT INTO exam_attempt_questions (attempt_id, position, subject, subject_position, question_source, question_id) VALUES (?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+        return attempt_id
+    finally:
+        conn.close()
+
+
+def create_jamb_attempt(username, course, ip=None, ua=None, subjects=None):
+    subjects = subjects or JAMB_COURSES.get(course)
+    if not subjects:
+        raise ExamError("Invalid course selected.")
+    return create_attempt(
+        username, "JAMB", course, subjects, duration_min=JAMB_DURATION_MIN,
+        per_subject=JAMB_OTHER_QUESTIONS, english_count=JAMB_ENGLISH_QUESTIONS, ip=ip, ua=ua,
+    )
+
+
+def _create_ssce_paper_attempt(exam, username, subject, ip=None, ua=None, paper=None):
+    """One SSCE objective paper (WAEC or NECO): the real question count and duration.
+
+    paper: optional paper label — English has two objective papers (objective/lexis
+    and Test of Orals); everything else has a single paper.
+    """
+    if exam == "WAEC":
+        from waec import get_paper, papers_for
+    else:
+        from neco import get_paper, papers_for
+    papers = papers_for(subject)
+    chosen = get_paper(subject, paper) if paper else (papers[0] if papers else None)
+    if not chosen:
+        raise ExamError(f"No {exam} questions are available yet for {subject}. Please try another subject or check back soon.")
+    label, count, minutes, note, topic_filter = chosen
+    name = f"{exam} {subject}" if len(papers) == 1 else f"{exam} {subject} — {label}"
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        source, _ = resolve_source(cur, exam, subject)
+        if not source:
+            raise ExamError(f"No {exam} questions are available yet for {subject}. Please try another subject or check back soon.")
+        ids = fetch_question_ids(cur, source, exam, subject,
+                                 topics=[topic_filter] if (topic_filter and source == "questions_v2") else None)
+        if len(ids) < MIN_BANK_FOR_V2:
+            raise ExamError(f"Not enough questions are available yet for {name}. Please try another subject or check back soon.")
+        seen = _seen_questions(cur, username, source)
+        plan = [(subject, source, _arrange(cur, source, ids, count, seen, exam_type=exam, subject=subject))]
+        conn.commit()
+    finally:
+        conn.close()
+    return create_attempt(username, exam, name, [subject], duration_min=minutes, plan=plan, ip=ip, ua=ua)
+
+
+def create_waec_attempt(username, subject, ip=None, ua=None, paper=None):
+    """One WAEC objective paper: the real question count and duration for that subject."""
+    return _create_ssce_paper_attempt("WAEC", username, subject, ip=ip, ua=ua, paper=paper)
+
+
+def create_neco_attempt(username, subject, ip=None, ua=None, paper=None):
+    """One NECO objective paper: the real question count and duration for that subject."""
+    return _create_ssce_paper_attempt("NECO", username, subject, ip=ip, ua=ua, paper=paper)
+
+
+def create_live_attempt(username, live_id, subjects, ip=None, ua=None):
+    """Saturday Live Mock: the same fixed paper (per subject) for every student that week."""
+    from study import live_paper
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        plan = []
+        for subject in subjects:
+            cap = JAMB_ENGLISH_QUESTIONS if subject == "Use of English" else JAMB_OTHER_QUESTIONS
+            source, ids = live_paper(cur, live_id, subject, cap)
+            if not ids:
+                raise ExamError(f"No questions are available yet for {subject}.")
+            plan.append((subject, source, ids))
+        conn.commit()
+    finally:
+        conn.close()
+    return create_attempt(username, "JAMB", "Saturday Live Mock", subjects, duration_min=JAMB_DURATION_MIN,
+                          mode="live", ip=ip, ua=ua, plan=plan, live_id=live_id)
+
+
+def create_post_utme_attempt(username, university, course, plan_counts, duration_min, ip=None, ua=None):
+    """plan_counts: ordered [(subject, n)] from post_utme.build_plan."""
+    subjects = [s for s, _ in plan_counts]
+    counts = {s: n for s, n in plan_counts}
+    name = f"{university}" + (f" — {course}" if course else "")
+    return create_attempt(
+        username, "POST-UTME", name, subjects, university=university, duration_min=duration_min or 30,
+        counts=counts, ip=ip, ua=ua,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reading an attempt (for the exam room)
+# ---------------------------------------------------------------------------
+
+def load_attempt_for_student(attempt_id, username):
+    """Return a JSON-serialisable payload WITHOUT correct answers."""
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        att = cur.execute("SELECT * FROM exam_attempts WHERE id = ? AND username = ?", (attempt_id, username)).fetchone()
+        if not att:
+            return None
+        qrows = cur.execute(
+            "SELECT position, subject, subject_position, question_source, question_id, selected_answer, is_flagged FROM exam_attempt_questions WHERE attempt_id = ? ORDER BY position",
+            (attempt_id,),
+        ).fetchall()
+
+        by_source = {}
+        for r in qrows:
+            by_source.setdefault(r["question_source"], []).append(r["question_id"])
+        bank = {}
+        for source, ids in by_source.items():
+            bank[source] = fetch_questions(cur, source, ids, with_answers=False)
+
+        questions = []
+        for r in qrows:
+            q = bank.get(r["question_source"], {}).get(r["question_id"])
+            if not q:
+                continue
+            questions.append({
+                "n": r["position"],
+                "subject": r["subject"],
+                "sn": r["subject_position"],
+                "text": q["text"],
+                "options": q["options"],
+                "passage": q.get("passage"),
+                "orals": bool(q.get("orals")),
+                "selected": r["selected_answer"],
+                "flagged": bool(r["is_flagged"]),
+                "qid": r["question_id"],
+                "src": r["question_source"],
+            })
+
+        subjects = json.loads(att["subjects_json"])
+        remaining = int((datetime.strptime(att["expires_at"], FMT) - datetime.now()).total_seconds())
+        return {
+            "id": att["id"],
+            "exam_type": att["exam_type"],
+            "exam_name": att["exam_name"],
+            "subjects": subjects,
+            "status": att["status"],
+            "remaining": max(0, remaining),
+            "duration": att["duration_seconds"],
+            "total": len(questions),
+            "questions": questions,
+        }
+    finally:
+        conn.close()
+
+
+def save_answer(attempt_id, username, position, answer=None, flagged=None):
+    """Persist a single answer/flag. Returns (ok, message)."""
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        att = cur.execute(
+            "SELECT status, expires_at FROM exam_attempts WHERE id = ? AND username = ?", (attempt_id, username)
+        ).fetchone()
+        if not att:
+            return False, "Attempt not found."
+        if att["status"] != "IN_PROGRESS":
+            return False, "This exam has already been submitted."
+        if datetime.strptime(att["expires_at"], FMT) <= datetime.now():
+            finalize_attempt(attempt_id, cur=cur, auto=True)
+            return False, "TIME_UP"
+
+        sets, params = [], []
+        if answer is not None:
+            answer = (answer or "").strip().upper()
+            if answer not in ("", "A", "B", "C", "D"):
+                return False, "Invalid option."
+            sets.append("selected_answer = ?")
+            params.append(answer or None)
+            sets.append("answered_at = ?")
+            params.append(datetime.now().strftime(FMT))
+        if flagged is not None:
+            sets.append("is_flagged = ?")
+            params.append(1 if flagged else 0)
+        if not sets:
+            return True, "Nothing to save."
+        params += [attempt_id, int(position)]
+        cur.execute(f"UPDATE exam_attempt_questions SET {', '.join(sets)} WHERE attempt_id = ? AND position = ?", params)
+        conn.commit()
+        return True, "Saved."
+    finally:
+        conn.close()
+
+
+def record_tab_switch(attempt_id, username):
+    conn = connect()
+    try:
+        conn.execute(
+            "UPDATE exam_attempts SET tab_switches = COALESCE(tab_switches, 0) + 1 WHERE id = ? AND username = ? AND status = 'IN_PROGRESS'",
+            (attempt_id, username),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Grading
+# ---------------------------------------------------------------------------
+
+def _grade(cur, attempt):
+    qrows = cur.execute(
+        "SELECT position, subject, question_source, question_id, selected_answer FROM exam_attempt_questions WHERE attempt_id = ? ORDER BY position",
+        (attempt["id"],),
+    ).fetchall()
+    by_source = {}
+    for r in qrows:
+        by_source.setdefault(r["question_source"], []).append(r["question_id"])
+    bank = {s: fetch_questions(cur, s, ids, with_answers=True) for s, ids in by_source.items()}
+
+    per_subject = {}
+    reviews = []
+    score = 0
+    for r in qrows:
+        q = bank.get(r["question_source"], {}).get(r["question_id"])
+        if not q:
+            continue
+        sel = (r["selected_answer"] or "").upper()
+        correct = q["correct"]
+        ok = 1 if sel and sel == correct else 0
+        score += ok
+        ps = per_subject.setdefault(r["subject"], {"score": 0, "total": 0, "answered": 0})
+        ps["total"] += 1
+        ps["score"] += ok
+        ps["answered"] += 1 if sel else 0
+        reviews.append({
+            "position": r["position"], "subject": r["subject"], "question_id": r["question_id"],
+            "question_source": r["question_source"], "question_text": q["text"], "options": q["options"],
+            "selected": sel or None, "correct": correct, "explanation": q["explanation"], "is_correct": ok,
+        })
+    return score, per_subject, reviews
+
+
+def finalize_attempt(attempt_id, username=None, cur=None, auto=False):
+    """Grade and persist the result. Returns result_id (or existing result_id if already finalised)."""
+    own = cur is None
+    if own:
+        conn = connect()
+        cur = conn.cursor()
+    conn = cur.connection
+    try:
+        if username:
+            attempt = cur.execute("SELECT * FROM exam_attempts WHERE id = ? AND username = ?", (attempt_id, username)).fetchone()
+        else:
+            attempt = cur.execute("SELECT * FROM exam_attempts WHERE id = ?", (attempt_id,)).fetchone()
+        if not attempt:
+            return None
+        if attempt["status"] != "IN_PROGRESS":
+            return attempt["result_id"]
+
+        score, per_subject, reviews = _grade(cur, attempt)
+        total = sum(v["total"] for v in per_subject.values()) or attempt["total_questions"] or 1
+        percentage = round(score * 100 / total)
+        status = "PASS" if percentage >= 70 else ("AVERAGE" if percentage >= 50 else "FAIL")
+        now = datetime.now()
+        started = datetime.strptime(attempt["started_at"], FMT)
+        expires = datetime.strptime(attempt["expires_at"], FMT)
+        end = min(now, expires) if auto else now
+        duration = max(0, int((end - started).total_seconds()))
+
+        jamb_score = None
+        if attempt["exam_type"] == "JAMB":
+            # Scale to JAMB's 400 marks: 100 per subject
+            jamb_score = 0
+            for v in per_subject.values():
+                jamb_score += round(100 * v["score"] / max(1, v["total"]))
+
+        code = new_verification_code()
+        cur.execute(
+            """
+            INSERT INTO results (username, exam_type, score, total, percentage, date_taken, exam_name, duration, status,
+                                 verification_code, attempt_id, jamb_score, mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (attempt["username"], attempt["exam_type"], score, total, percentage, now.strftime(FMT), attempt["exam_name"],
+             duration, status, code, attempt["id"], jamb_score, attempt["mode"]),
+        )
+        result_id = cur.lastrowid
+
+        for subject, v in per_subject.items():
+            cur.execute(
+                """
+                INSERT INTO result_subjects (result_id, username, exam_type, exam_name, subject, score, total_questions, percentage, time_spent)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (str(result_id), attempt["username"], attempt["exam_type"], attempt["exam_name"], subject, v["score"],
+                 v["total"], round(100 * v["score"] / max(1, v["total"]), 2), duration),
+            )
+        cur.executemany(
+            """
+            INSERT INTO review_answers (result_id, username, subject, question_text, selected_answer, correct_answer,
+                                        explanation, is_correct, exam_type, question_id, question_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (result_id, attempt["username"], r["subject"], r["question_text"], r["selected"], r["correct"],
+                 r["explanation"], r["is_correct"], attempt["exam_type"], r["question_id"], r["question_source"])
+                for r in reviews
+            ],
+        )
+        cur.execute(
+            "UPDATE exam_attempts SET status = ?, submitted_at = ?, score = ?, percentage = ?, result_id = ? WHERE id = ?",
+            ("AUTO_SUBMITTED" if auto else "SUBMITTED", now.strftime(FMT), score, percentage, result_id, attempt["id"]),
+        )
+        # Syllabus coverage: every graded answer updates the student's per-topic record.
+        try:
+            from study import record_many
+            record_many(cur, attempt["username"], attempt["exam_type"],
+                        [(r["subject"], r["question_source"], r["question_id"], r["is_correct"]) for r in reviews])
+        except Exception:
+            logging.getLogger("prepnova").exception("topic progress failed")
+        # "Fix my mistakes": remember every wrong/blank answer, clear the ones answered correctly.
+        try:
+            for r in reviews:
+                if r["is_correct"]:
+                    clear_mistake(cur, attempt["username"], r["question_source"], r["question_id"])
+                else:
+                    record_mistake(cur, attempt["username"], r["question_source"], r["question_id"], r["subject"], attempt["exam_type"])
+        except Exception:
+            logging.getLogger("prepnova").exception("mistake tracking failed")
+        # Referral reward: the invited friend's FIRST mock unlocks bonus days for both students.
+        try:
+            n_results = cur.execute("SELECT COUNT(*) FROM results WHERE username = ?", (attempt["username"],)).fetchone()[0]
+            if n_results == 1:
+                reward_referral_if_due(cur, attempt["username"])
+        except Exception:  # never let a bonus break a submission
+            logging.getLogger("prepnova").exception("referral reward failed")
+        conn.commit()
+        return result_id
+    finally:
+        if own:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Result reading
+# ---------------------------------------------------------------------------
+
+def load_result(result_id, username=None):
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        if username:
+            r = cur.execute("SELECT * FROM results WHERE id = ? AND username = ?", (result_id, username)).fetchone()
+        else:
+            r = cur.execute("SELECT * FROM results WHERE id = ?", (result_id,)).fetchone()
+        if not r:
+            return None
+        subjects = cur.execute(
+            "SELECT subject, score, total_questions, percentage FROM result_subjects WHERE result_id = ? ORDER BY id",
+            (str(result_id),),
+        ).fetchall()
+        attempt = None
+        if r["attempt_id"]:
+            attempt = cur.execute("SELECT * FROM exam_attempts WHERE id = ?", (r["attempt_id"],)).fetchone()
+        user = cur.execute("SELECT name, email, phone FROM users WHERE email = ?", (r["username"],)).fetchone()
+        return {"result": r, "subjects": subjects, "attempt": attempt, "user": user}
+    finally:
+        conn.close()
+
+
+def topic_report(result_id, username=None):
+    """Per-subject, per-topic breakdown of one result: [{subject, topics: [{topic, score, total, pct}], weak: [...]}].
+
+    Only curated-bank rows carry a topic, so legacy rows are grouped under 'General'."""
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        if username:
+            r = cur.execute("SELECT id FROM results WHERE id = ? AND username = ?", (result_id, username)).fetchone()
+        else:
+            r = cur.execute("SELECT id FROM results WHERE id = ?", (result_id,)).fetchone()
+        if not r:
+            return []
+        rows = cur.execute(
+            "SELECT subject, question_source, question_id, is_correct FROM review_answers WHERE result_id = ? ORDER BY id", (result_id,)
+        ).fetchall()
+        by_source = {}
+        for row in rows:
+            if row["question_source"] and row["question_id"]:
+                by_source.setdefault(row["question_source"], []).append(row["question_id"])
+        bank = {s: fetch_questions(cur, s, ids, with_answers=False) for s, ids in by_source.items()}
+        agg = {}
+        for row in rows:
+            q = bank.get(row["question_source"] or "", {}).get(row["question_id"]) if row["question_id"] else None
+            topic = (q or {}).get("topic") or "General"
+            cell = agg.setdefault(row["subject"], {}).setdefault(topic, [0, 0])
+            cell[1] += 1
+            cell[0] += 1 if row["is_correct"] else 0
+        out = []
+        for subject, topics in agg.items():
+            items = [{"topic": t, "score": v[0], "total": v[1], "pct": round(100 * v[0] / v[1])} for t, v in topics.items()]
+            items.sort(key=lambda x: (x["pct"], -x["total"], x["topic"]))
+            weak = [x for x in items if x["pct"] < 50 and x["topic"] != "General"]
+            out.append({"subject": subject, "topics": items, "weak": weak})
+        return out
+    finally:
+        conn.close()
+
+
+def load_review(result_id, username=None):
+    conn = connect()
+    cur = conn.cursor()
+    try:
+        if username:
+            r = cur.execute("SELECT * FROM results WHERE id = ? AND username = ?", (result_id, username)).fetchone()
+        else:
+            r = cur.execute("SELECT * FROM results WHERE id = ?", (result_id,)).fetchone()
+        if not r:
+            return None, []
+        rows = cur.execute(
+            "SELECT * FROM review_answers WHERE result_id = ? ORDER BY id", (result_id,)
+        ).fetchall()
+        # Attach options where we can (new-style rows store question_source)
+        by_source = {}
+        for row in rows:
+            if row["question_source"] and row["question_id"]:
+                by_source.setdefault(row["question_source"], []).append(row["question_id"])
+        bank = {s: fetch_questions(cur, s, ids, with_answers=False) for s, ids in by_source.items()}
+        items = []
+        for i, row in enumerate(rows, start=1):
+            q = bank.get(row["question_source"] or "", {}).get(row["question_id"]) if row["question_id"] else None
+            items.append({
+                "n": i,
+                "subject": row["subject"],
+                "text": row["question_text"],
+                "options": q["options"] if q else None,
+                "passage": q.get("passage") if q else None,
+                "orals": bool(q.get("orals")) if q else False,
+                "selected": row["selected_answer"],
+                "correct": row["correct_answer"],
+                "explanation": row["explanation"],
+                "is_correct": bool(row["is_correct"]),
+                "question_id": row["question_id"],
+                "source": row["question_source"],
+            })
+        return r, items
+    finally:
+        conn.close()
